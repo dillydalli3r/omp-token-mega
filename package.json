@@ -1,0 +1,302 @@
+{
+  "name": "@dillydalli3r/omp-token-mega",
+  "version": "1.0.0",
+  "description": "One oh-my-pi plugin for the token economy: cache-safe reduction of live tool results, DeepSeek prefix-cache accounting with miss attribution, and the DeepSeek account balance and session spend. One command, one settings menu, one status row.",
+  "license": "MIT",
+  "author": "dillydalli3r",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dillydalli3r/omp-token-mega.git"
+  },
+  "homepage": "https://github.com/dillydalli3r/omp-token-mega",
+  "bugs": {
+    "url": "https://github.com/dillydalli3r/omp-token-mega/issues"
+  },
+  "keywords": [
+    "omp",
+    "oh-my-pi",
+    "tokens",
+    "cost",
+    "compression",
+    "tool-output",
+    "dedupe",
+    "context",
+    "deepseek",
+    "prefix-cache",
+    "prompt-cache",
+    "kv-cache",
+    "cache-hit-rate",
+    "balance",
+    "spend",
+    "statusline",
+    "tui",
+    "subagents"
+  ],
+  "omp": {
+    "extensions": [
+      "./src/index.js"
+    ],
+    "settings": {
+      "enabled": {
+        "type": "boolean",
+        "default": true,
+        "env": "OMP_TOKEN_MEGA_ENABLED",
+        "description": "Master switch. false makes the whole plugin inert: no hooks, no counters, no shards, no network call, no status row."
+      },
+      "statusRow": {
+        "type": "boolean",
+        "default": true,
+        "env": "OMP_TOKEN_MEGA_STATUS_ROW",
+        "description": "Draw the status row. Every metric this plugin tracks goes on that one line; turn it off to keep the numbers on demand only."
+      },
+      "statusMaxChars": {
+        "type": "number",
+        "default": 120,
+        "min": 40,
+        "max": 400,
+        "env": "OMP_TOKEN_MEGA_STATUS_MAX_CHARS",
+        "description": "Maximum width of the status row. A segment that does not fit is dropped whole, never half-written."
+      },
+      "statusSegments": {
+        "type": "string",
+        "default": "cache,lithos,balance,token",
+        "env": "OMP_TOKEN_MEGA_STATUS_SEGMENTS",
+        "description": "Which groups the row shows, in order: cache, lithos, balance, token. Unknown names are ignored; an empty list hides the row."
+      },
+      "stateDir": {
+        "type": "string",
+        "default": "",
+        "env": "OMP_TOKEN_MEGA_DIR",
+        "description": "Directory holding the cache-accounting shards. Empty uses <agentDir>/omp-token-mega-stats.d."
+      },
+      "token.enabled": {
+        "type": "boolean",
+        "default": true,
+        "env": "OMP_TOKEN_MEGA_TOKEN_ENABLED",
+        "description": "Reduce tool results before they are first sent. Independent of the cache accounting and the balance poller."
+      },
+      "token.preset": {
+        "type": "enum",
+        "values": [
+          "off",
+          "conservative",
+          "balanced",
+          "aggressive",
+          "max"
+        ],
+        "default": "balanced",
+        "env": "OMP_TOKEN_MEGA_TOKEN_PRESET",
+        "description": "Named bundle of every other token.* knob, covering the extremes. Individual settings override it."
+      },
+      "token.tools": {
+        "type": "string",
+        "default": "bash,grep,glob,web_search,eval,mcp__*",
+        "env": "OMP_TOKEN_MEGA_TOKEN_TOOLS",
+        "description": "Comma-separated tool names to reduce. `*` means every tool, `prefix*` matches a name prefix (`mcp__*` = all MCP tools), `-name` excludes."
+      },
+      "token.minChars": {
+        "type": "number",
+        "default": 2000,
+        "min": 0,
+        "max": 1000000,
+        "env": "OMP_TOKEN_MEGA_TOKEN_MIN_CHARS",
+        "description": "Results below this size are left untouched: a marker is not worth a rewrite."
+      },
+      "token.maxScanBytes": {
+        "type": "number",
+        "default": 262144,
+        "min": 4096,
+        "max": 16777216,
+        "env": "OMP_TOKEN_MEGA_TOKEN_MAX_SCAN_BYTES",
+        "description": "Hard ceiling on the text this plugin will scan. Larger results go straight to omp's own artifact spill. Bounds worst-case hook time."
+      },
+      "token.squeeze": {
+        "type": "boolean",
+        "default": true,
+        "env": "OMP_TOKEN_MEGA_TOKEN_SQUEEZE",
+        "description": "Strip terminal escapes, control characters and trailing whitespace; collapse blank-line runs."
+      },
+      "token.fold": {
+        "type": "boolean",
+        "default": true,
+        "env": "OMP_TOKEN_MEGA_TOKEN_FOLD",
+        "description": "Collapse runs of identical consecutive lines into one line plus a count."
+      },
+      "token.foldMinRun": {
+        "type": "number",
+        "default": 4,
+        "min": 2,
+        "max": 100,
+        "env": "OMP_TOKEN_MEGA_TOKEN_FOLD_MIN_RUN",
+        "description": "Shortest run of identical lines worth folding."
+      },
+      "token.clip": {
+        "type": "number",
+        "default": 768,
+        "min": 0,
+        "max": 100000,
+        "env": "OMP_TOKEN_MEGA_TOKEN_CLIP",
+        "description": "Per-line column cap for tools omp does not already cap. 0 disables. omp's own tools.outputMaxColumns default is 768."
+      },
+      "token.json": {
+        "type": "boolean",
+        "default": true,
+        "env": "OMP_TOKEN_MEGA_TOKEN_JSON",
+        "description": "Remove whitespace outside JSON string literals from payloads that parse as JSON. A string-aware strip, never a parse-and-reserialize, so numeric literals are preserved."
+      },
+      "token.dedupe": {
+        "type": "boolean",
+        "default": true,
+        "env": "OMP_TOKEN_MEGA_TOKEN_DEDUPE",
+        "description": "Replace a result whose content is byte-identical to an earlier one in this session with a back-reference."
+      },
+      "token.dedupeMinChars": {
+        "type": "number",
+        "default": 512,
+        "min": 64,
+        "max": 1000000,
+        "env": "OMP_TOKEN_MEGA_TOKEN_DEDUPE_MIN_CHARS",
+        "description": "Shortest result eligible for duplicate collapsing."
+      },
+      "token.maxChars": {
+        "type": "number",
+        "default": 0,
+        "min": 0,
+        "max": 1000000,
+        "env": "OMP_TOKEN_MEGA_TOKEN_MAX_CHARS",
+        "description": "Per-result budget. Above it the middle is elided behind an artifact:// handle. 0 defers to omp's tools.artifactSpillThreshold (50 KB)."
+      },
+      "token.headChars": {
+        "type": "number",
+        "default": 6000,
+        "min": 0,
+        "max": 500000,
+        "env": "OMP_TOKEN_MEGA_TOKEN_HEAD_CHARS",
+        "description": "Bytes kept from the start when a result is elided to its budget."
+      },
+      "token.tailChars": {
+        "type": "number",
+        "default": 6000,
+        "min": 0,
+        "max": 500000,
+        "env": "OMP_TOKEN_MEGA_TOKEN_TAIL_CHARS",
+        "description": "Bytes kept from the end when a result is elided to its budget."
+      },
+      "token.stash": {
+        "type": "boolean",
+        "default": true,
+        "env": "OMP_TOKEN_MEGA_TOKEN_STASH",
+        "description": "Write removed text to a session artifact so artifact://<id> recovers it. The store omp's own spill uses."
+      },
+      "token.minSavingsTokens": {
+        "type": "number",
+        "default": 24,
+        "min": 0,
+        "max": 100000,
+        "env": "OMP_TOKEN_MEGA_TOKEN_MIN_SAVINGS_TOKENS",
+        "description": "A rewrite must save this much on top of the marker it adds, or the original is sent untouched."
+      },
+      "token.perf": {
+        "type": "boolean",
+        "default": true,
+        "env": "OMP_TOKEN_MEGA_TOKEN_PERF",
+        "description": "Time the tool-result hook and report p50/max in the report, so the throughput cost is visible."
+      },
+      "cache.enabled": {
+        "type": "boolean",
+        "default": true,
+        "env": "OMP_TOKEN_MEGA_CACHE_ENABLED",
+        "description": "Measure the DeepSeek prefix cache: accounting, miss attribution, drift notes. Active only while a DeepSeek model is loaded."
+      },
+      "cache.subagents": {
+        "type": "boolean",
+        "default": true,
+        "env": "OMP_TOKEN_MEGA_CACHE_SUBAGENTS",
+        "description": "Aggregate the shards this process's subagent sessions write."
+      },
+      "cache.idleTtlMinutes": {
+        "type": "number",
+        "default": 5,
+        "min": 1,
+        "max": 1440,
+        "env": "OMP_TOKEN_MEGA_CACHE_IDLE_TTL_MINUTES",
+        "description": "Idle gap after which a miss is attributed to the provider cache expiring (`idle_ttl`)."
+      },
+      "cache.retentionDays": {
+        "type": "number",
+        "default": 7,
+        "min": 0,
+        "max": 365,
+        "env": "OMP_TOKEN_MEGA_CACHE_RETENTION_DAYS",
+        "description": "Delete shards not written for this many days. 0 keeps them forever."
+      },
+      "lithos.enabled": {
+        "type": "boolean",
+        "default": true,
+        "env": "OMP_TOKEN_MEGA_LITHOS_ENABLED",
+        "description": "Register the LithosAI provider (models, /login, usage reporting), measure its speed and per-minute budgets, and draw its segment. Requires a restart to take effect when switched off."
+      },
+      "lithos.baseUrl": {
+        "type": "string",
+        "default": "https://api.lithosai.cloud/v1",
+        "env": "OMP_TOKEN_MEGA_LITHOS_BASE_URL",
+        "description": "LithosAI endpoint. Point it at a self-hosted Lithos Engine to use the same provider, login and metrics on-prem."
+      },
+      "lithos.inputPerMillion": {
+        "type": "number",
+        "default": 0,
+        "min": 0,
+        "max": 100000,
+        "env": "OMP_TOKEN_MEGA_LITHOS_INPUT_PER_MILLION",
+        "description": "USD per million input tokens, from the console's rate card. 0 leaves cost unknown and the spend columns read $0."
+      },
+      "lithos.outputPerMillion": {
+        "type": "number",
+        "default": 0,
+        "min": 0,
+        "max": 100000,
+        "env": "OMP_TOKEN_MEGA_LITHOS_OUTPUT_PER_MILLION",
+        "description": "USD per million output tokens. Cached input is a subset of input, not an addition to it."
+      },
+      "lithos.cachedPerMillion": {
+        "type": "number",
+        "default": 0,
+        "min": 0,
+        "max": 100000,
+        "env": "OMP_TOKEN_MEGA_LITHOS_CACHED_PER_MILLION",
+        "description": "USD per million cached input tokens."
+      },
+      "balance.enabled": {
+        "type": "boolean",
+        "default": true,
+        "env": "OMP_TOKEN_MEGA_BALANCE_ENABLED",
+        "description": "Poll the DeepSeek account balance for the status row. Off means no balance request is ever made; session spend is unaffected."
+      },
+      "balance.ttlSeconds": {
+        "type": "number",
+        "default": 60,
+        "min": 15,
+        "max": 3600,
+        "env": "OMP_TOKEN_MEGA_BALANCE_TTL_SECONDS",
+        "description": "How long a fetched balance is reused before the poller refreshes it."
+      }
+    }
+  },
+  "files": [
+    "src",
+    "scripts",
+    "test",
+    "README.md",
+    "LICENSE",
+    "CREDITS.md"
+  ],
+  "scripts": {
+    "check": "node --check src/index.js && node --check src/config.js && node --check src/status.js && node --check src/report.js && node --check src/menu.js && node --check src/token.js && node --check src/cache.js && node --check src/balance.js && node --check src/balance-client.js && node --check src/compress.js && node --check src/dedupe.js && node --check src/measure.js && node --check src/audit.js && node --check src/stats.js && node --check src/prefix.js && node --check src/deepseek.js && node --check src/repair.js && node --check src/usage.js",
+    "test": "node test/token.test.mjs && node test/cache.test.mjs && node test/lithosai.test.mjs && node test/balance.test.mjs && node test/shell.test.mjs",
+    "manifest": "node scripts/manifest.mjs > package.json"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

@@ -1,0 +1,39 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "omp-token-mega",
+  "owner": {
+    "name": "dillydalli3r",
+    "url": "https://github.com/dillydalli3r"
+  },
+  "metadata": {
+    "description": "One plugin for the oh-my-pi token economy: cache-safe tool-result reduction, DeepSeek prefix-cache accounting, and the DeepSeek account balance — one command, one settings menu, one status row.",
+    "version": "1.0.0",
+    "pluginRoot": "."
+  },
+  "plugins": [
+    {
+      "name": "omp-token-mega",
+      "description": "Merged token plugin for oh-my-pi. Reduces live tool results before they are sent (terminal escapes, identical line runs, over-long lines, pretty-printed JSON), collapses byte-identical results by content hash, elides over-budget results behind artifact:// handles, audits the request envelope with copy-paste omp config advice, accounts the DeepSeek prefix cache (hit rate, miss attribution, tool-catalogue drift, subagent shards), reports the DeepSeek account balance and session spend, and draws every metric on ONE status row. Never rewrites history, so DeepSeek/OpenAI/Anthropic prefix caches keep their hits.",
+      "version": "1.0.0",
+      "category": "development",
+      "source": "./",
+      "homepage": "https://github.com/dillydalli3r/omp-token-mega",
+      "author": { "name": "dillydalli3r" },
+      "license": "MIT",
+      "keywords": [
+        "tokens",
+        "cost",
+        "compression",
+        "tool-output",
+        "prefix-cache",
+        "prompt-cache",
+        "deepseek",
+        "balance",
+        "spend",
+        "dedupe",
+        "context",
+        "statusline"
+      ]
+    }
+  ]
+}
