@@ -6,7 +6,7 @@ DeepSeek account it is spending, and adds the [LithosAI](#lithosai) provider wit
 and rate-limit metrics — behind **one command, one settings menu and one status row**.
 
 ```
-DS cache 92% · 120k cached · $0.84 saved · off-peak (peak 06:00–10:00Z) · DS ¥11.48 · used $1.27 · TS -28.8 KB (~7.4k tok) · 1/1 results
+DS cache 92% · 120k cached · $0.84 saved · off-peak, peak 2026-09-20 21:00–2026-09-21 00:00 EDT · DS ¥11.48 · used $1.27 · TS -28.8 KB (~7.4k tok) · 1/1 results
 LITHOS 812 tok/s · req 58/60 · tok 131k/256k · TS -28.8 KB (~7.4k tok)
 ```
 
@@ -80,17 +80,24 @@ One command, `/mega`:
 
 | Command | Effect |
 | --- | --- |
-| `/mega` | One report: token saving, prefix cache, LithosAI, account — in that order. |
+| `/mega` | The menu: report, status, settings, preset, audit, cache, LithosAI, balance, reset. |
+| `/mega report` | One report: token saving, prefix cache, LithosAI, account — in that order. |
 | `/mega status` | The status row, as plain text and untinted, for modes where the widget is not drawn. |
 | `/mega config` | All 34 settings, grouped, with the layer that supplied each (`default`, `preset:<name>`, `global`, `project`, `env`). |
 | `/mega config reset [key] [global\|project]` | Drop stored settings so defaults and presets apply again; names any env var still overriding. |
-| `/mega menu` | Interactive settings menu, grouped by feature. |
+| `/mega menu` | The same menu, spelled out (a bare `/mega` opens it too). |
 | `/mega preset [off\|conservative\|balanced\|aggressive\|max]` | Show or switch the token-saving bundle. |
 | `/mega audit` | Where this session's input tokens actually go, and which omp knobs to change. |
 | `/mega cache [doctor\|fix\|rollback]` | Cache section, or the compat-key doctor, its repair (backup + receipt) and the rollback. |
-| `/mega lithos` | LithosAI: endpoint, model, rates, measured speed, per-minute budgets, session spend. |
+| `/mega lithos` | LithosAI: endpoint, catalogue, what `/models` served, rates, measured speed, budgets, spend. |
 | `/mega balance` | DeepSeek account balance and the session spend table. |
 | `/mega reset` | Zero this session's counters. |
+
+`/mega` on its own opens the menu rather than printing the report, because the menu is where
+every action lives and the report is its first entry. Subcommands stay: they are what a script,
+a keystroke macro or a host without dialogs uses, and each menu entry calls the same function
+the subcommand does. A dialog host that cannot answer gets the report or the settings text
+instead of a hung command.
 
 The model also gets one tool, `deepseek_balance`, which returns the balance-and-spend section
 for the model itself.
@@ -134,11 +141,17 @@ plugin computed itself.
 - **Hit rate and savings** — token-weighted, priced at the tariff in force when the request was
   sent (DeepSeek's off-peak multiplier included), main session and subagents reported
   separately and summed.
-- **Peak indicator** — the row names the window the tariff is in: `peak 01:00–04:00Z` while peak
-  is in force, `off-peak (peak 06:00–10:00Z)` off peak, and
-  `off-peak (peak Mon 01:00–04:00Z)` when the next window opens on a later weekday. Peak is
-  tinted in the theme's error colour, off peak in success. A model that bills both periods the
-  same shows no peak text at all — and no "Price period" line in `/mega cache` either.
+- **Peak indicator** — the row names the window the tariff is in, in **your** zone, dated, with
+  the zone named: `peak 2026-09-15 21:00–2026-09-16 00:00 EDT` while peak is in force,
+  `off-peak, peak 2026-09-20 21:00–2026-09-21 00:00 EDT` off peak. DeepSeek declares its
+  windows in UTC (`01:00–04:00Z`, `06:00–10:00Z`, Mon–Fri), so the schedule is converted at the
+  offset in force: the same window reads `20:00–23:00 EST` in January, and a window that
+  crosses local midnight shows both dates. Off peak always names the next window *and its
+  date*, which can be up to a week away, so "when is peak" needs no mental arithmetic. The UTC
+  bounds stay in `/mega cache`, where the rate card is quoted: `Price period: off-peak … —
+  next window: peak Mon 01:00–04:00Z = 2026-09-20 21:00–2026-09-21 00:00 EDT`. Peak is tinted in
+  the theme's error colour, off peak in success. A model that bills both periods the same shows
+  no peak text at all — and no "Price period" line in `/mega cache` either.
 - **Miss attribution** — `first_turn`, `tool_change`, `system_prompt_change`, `idle_ttl`,
   `compaction`, `branch_nav`, `resume`, `external_miss`. A cold start is a miss too, so expected
   misses stay separable from regressions.
@@ -164,14 +177,24 @@ with the variable unset, the stored login is the only credential that can exist.
 omp reports no credentials for `lithosai` — nothing claims to be logged in, and `/models` is not
 called. Create keys at <https://console.lithosai.cloud/keys>.
 
-**Models.** The live catalogue is fetched from `GET /models` with that key (login-stored or
-environment) and the returned ids are registered at the configured rates.
-`moonshotai/Kimi-K3` — the model LithosAI's own omp guide names — remains the offline fallback
-declared in the registration. A failed `/models` call keeps the last good catalogue: the fetch
-rejects, so omp holds on to the models it already discovered and retries, rather than replacing
-them with an empty list. Their `/models` response carries ids and owners only, so discovered
-models are registered with the limits from that guide (256K context, 32K output); put different
-ones in `models.yml` if your console shows something else.
+**Models.** Every model LithosAI serves is declared in the registration, so all of them are
+pickable before anything is fetched:
+
+```
+deepseek-ai/DeepSeek-V4.1-Flash   moonshotai/Kimi-K3   moonshotai/Kimi-K3-fast   moonshotai/Kimi-K3-ultra
+```
+
+The live catalogue is refreshed from `GET /models` with that key (login-stored or environment)
+whenever it answers, and any id the bundle does not know is registered from the response. The
+bundle matters because omp runs discovery *after* the provider loads and keeps the previous
+catalogue when the fetch fails: without it, an install whose endpoint is unreachable — a
+resolver that filters the host, a machine offline, a key that has not been pasted yet — would
+offer a single model and look like the service had one. `/mega lithos` reports what the endpoint
+served last (`4 model(s) at 06:20:11 UTC, all in the bundled catalogue`) and says so plainly
+when it could not be reached, naming the list the picker fell back to. Their `/models` response
+carries ids and owners only, so models are registered with the limits from LithosAI's own omp
+guide (256K context, 32K output); put different ones in `models.yml` if your console shows
+something else.
 
 **Metrics.** Three numbers, on the one row and in `/mega lithos`:
 
@@ -235,9 +258,11 @@ Environment fallbacks are `OMP_TOKEN_MEGA_*` (`OMP_TOKEN_MEGA_TOKEN_*`, `OMP_TOK
 `OMP_TOKEN_MEGA_LITHOS_*`, `OMP_TOKEN_MEGA_BALANCE_*` for the groups), listed as `env:` by
 `omp plugin config list`.
 
-`/mega menu` edits all of it in the TUI, grouped by feature: pick a group, pick a key, and the
-write goes through `omp plugin config` so omp's own files stay authoritative. In print, RPC and
-ACP modes the same content is printed as text with the exact shell commands.
+The menu edits all of it in the TUI: `/mega` opens it, **Settings** groups the keys by feature and
+edits one at a time, and the write goes through `omp plugin config` so omp's own files stay
+authoritative. The menu also switches the preset, prints the values with their sources, resets
+stored settings and opens every report, so none of the subcommands has to be remembered. In
+print, RPC and ACP modes the same content is printed as text with the exact shell commands.
 
 ### Deliberately not implemented
 
@@ -264,8 +289,8 @@ Then re-apply your settings under the new key: settings are namespaced per packa
 `@dillydalli3r/omp-token-saver` / `…-mega-cache` entries do not carry over. Prefixed names are
 the only change — `minChars` became `token.minChars`, `idleTtlMinutes` became
 `cache.idleTtlMinutes`, and the shared shell keys (`enabled`, `statusRow`, `statusMaxChars`,
-`stateDir`) kept their names. `/mega config` prints the effective values, `/mega menu` edits
-them.
+`stateDir`) kept their names. `/mega config` prints the effective values and the `/mega` menu
+edits them.
 
 Leftovers from the old installs are safe to delete: the shard directory
 `~/.omp/agent/omp-deepseek-mega-cache-stats.d/` (the merged plugin uses

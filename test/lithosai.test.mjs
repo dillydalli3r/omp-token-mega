@@ -289,6 +289,109 @@ await withConfig({}, async () => {
 	}
 }
 
+// ----------------------------------------------------------------- the catalogue
+
+{
+	// What LithosAI's own `/v1/models` answered, in its own order. The registration has to
+	// declare all of it: omp runs discovery *after* the provider loads and treats a failed
+	// fetch as "keep what you have", so a catalogue of one model leaves an install whose
+	// endpoint is unreachable — a filtered resolver, a machine offline, no key yet —
+	// choosing between one model and none.
+	const SERVED = [
+		"deepseek-ai/DeepSeek-V4.1-Flash",
+		"moonshotai/Kimi-K3",
+		"moonshotai/Kimi-K3-fast",
+		"moonshotai/Kimi-K3-ultra",
+	];
+
+	const ambient = process.env[LITHOS_KEY_ENV];
+	process.env[LITHOS_KEY_ENV] = "lithos-test-key";
+	try {
+		await withConfig({}, async () => {
+			const host = await makeHost({ model: LITHOS_MODEL });
+			await host.start();
+			await tick();
+			const provider = host.providers.get(LITHOS_PROVIDER);
+			const declared = provider.config.models.map((model) => model.id);
+			expect("catalogue: every served id is declared, in the service's order", declared.join(",") === SERVED.join(","), declared);
+			// The model the user asked for by name, and the name the console gives it.
+			const deepseek = provider.config.models.find((model) => model.id === "deepseek-ai/DeepSeek-V4.1-Flash");
+			expect("catalogue: DeepSeek V4.1 Flash is declared with its console name", deepseek?.name === "DeepSeek V4.1 Flash on LithosAI", deepseek);
+			expect("catalogue: every entry is loadable as-is", provider.config.models.every((model) => model.name && model.contextWindow > 0 && model.maxTokens > 0 && model.cost), provider.config.models[0]);
+
+			// The same id has to be the same entry whether it arrives declared or discovered:
+			// omp merges the two by id, so a name or a cost that differed would change under
+			// the user the first time discovery succeeded.
+			const realFetch = globalThis.fetch;
+			globalThis.fetch = async () => ({
+				ok: true,
+				status: 200,
+				json: async () => ({ object: "list", data: [...SERVED, "zai/GLM-5.3"].map((id) => ({ id, object: "model" })) }),
+			});
+			let discovered;
+			try {
+				discovered = await provider.config.fetchDynamicModels("lithos-test-key");
+			} finally {
+				globalThis.fetch = realFetch;
+			}
+			expect(
+				"catalogue: discovery restates a declared model unchanged",
+				SERVED.every((id) => JSON.stringify(discovered.find((model) => model.id === id)) === JSON.stringify(provider.config.models.find((model) => model.id === id))),
+				discovered,
+			);
+			expect(
+				"catalogue: an id the bundle does not know is still registered",
+				discovered.find((model) => model.id === "zai/GLM-5.3")?.name === "zai/GLM-5.3 on LithosAI",
+				discovered.at(-1),
+			);
+
+			// The report has to say which list the picker is showing: the endpoint's, or the
+			// bundle's when the endpoint could not be reached.
+			await host.commands.get("mega").handler("lithos", host.ctx);
+			expect(
+				"catalogue: the report names what /models served",
+				/5 model\(s\) at \d\d:\d\d:\d\d UTC, new: `zai\/GLM-5\.3`/.test(host.rendered),
+				host.rendered.slice(0, 500),
+			);
+			expect("catalogue: the report lists the bundled ids", SERVED.every((id) => host.rendered.includes(`\`${id}\``)), host.rendered.slice(0, 400));
+		});
+
+		// An unreachable endpoint: the fetch rejects (omp keeps the catalogue and retries),
+		// and the report has to explain why the picker is showing the bundled list instead of
+		// leaving a one-model provider unexplained.
+		await withConfig({}, async () => {
+			const host = await makeHost({ model: LITHOS_MODEL });
+			await host.start();
+			await tick();
+			const provider = host.providers.get(LITHOS_PROVIDER);
+			const realFetch = globalThis.fetch;
+			globalThis.fetch = async () => {
+				throw new Error("getaddrinfo ENOTFOUND api.lithosai.cloud");
+			};
+			try {
+				let thrown;
+				try {
+					await provider.config.fetchDynamicModels("lithos-test-key");
+				} catch (error) {
+					thrown = error;
+				}
+				expect("catalogue: an unreachable endpoint rejects the fetch", thrown instanceof Error && thrown.message.includes("ENOTFOUND"), thrown?.message);
+			} finally {
+				globalThis.fetch = realFetch;
+			}
+			await host.commands.get("mega").handler("lithos", host.ctx);
+			expect(
+				"catalogue: the report names the failure and the list the picker falls back to",
+				/unreachable at \d\d:\d\d:\d\d UTC — getaddrinfo ENOTFOUND/.test(host.rendered) && host.rendered.includes("`/model` offers the bundled catalogue"),
+				host.rendered.slice(0, 500),
+			);
+		});
+	} finally {
+		if (ambient === undefined) delete process.env[LITHOS_KEY_ENV];
+		else process.env[LITHOS_KEY_ENV] = ambient;
+	}
+}
+
 // ----------------------------------------------------------------- rates
 
 await withConfig({ "lithos.inputPerMillion": 0.6, "lithos.outputPerMillion": 2.4, "lithos.cachedPerMillion": 0.06 }, async () => {

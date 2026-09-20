@@ -43,14 +43,27 @@ export const LITHOS_BASE_URL = "https://api.lithosai.cloud/v1";
 export const LITHOS_KEY_ENV = "LITHOSAI_API_KEY";
 export const LITHOS_CONSOLE_KEYS_URL = "https://console.lithosai.cloud/keys";
 
-/** The model id LithosAI's own omp guide names; the live catalogue comes from `/models`. */
-export const LITHOS_DEFAULT_MODEL = "moonshotai/Kimi-K3";
 /**
- * Limits for the static fallback model, from that same guide. `/models` returns ids and
- * owners only — no limits and no rates — so discovered models are registered with these
- * and the configured rates; a console that shows something else is an override in
- * `models.yml` away.
+ * The models LithosAI serves, in the order the service reports them from `/v1/models`.
+ *
+ * The registration declares every one of them, because a picker can only offer what the
+ * provider slice holds: `fetchDynamicModels` runs *after* the provider loads and its result
+ * is cached, so an install whose endpoint is unreachable — a filtered resolver, an offline
+ * machine, a key that has not been pasted yet — would otherwise show a single model and look
+ * like the service had one. The live catalogue still wins wherever it answers: it is
+ * authoritative for the provider, and any id that is not in this list is registered as
+ * discovered. Ids and owners come from that same endpoint; limits come from the omp guide,
+ * because `/models` reports neither limits nor rates.
  */
+export const LITHOS_CATALOGUE = [
+	{ id: "deepseek-ai/DeepSeek-V4.1-Flash", name: "DeepSeek V4.1 Flash" },
+	{ id: "moonshotai/Kimi-K3", name: "Kimi K3" },
+	{ id: "moonshotai/Kimi-K3-fast", name: "Kimi K3 Fast" },
+	{ id: "moonshotai/Kimi-K3-ultra", name: "Kimi K3 Ultra" },
+];
+
+/** The model LithosAI's own omp guide names as the default. */
+export const LITHOS_DEFAULT_MODEL = "moonshotai/Kimi-K3";
 export const LITHOS_CONTEXT_WINDOW = 262_144;
 export const LITHOS_MAX_TOKENS = 32_768;
 
@@ -128,36 +141,36 @@ export function parseRateLimitHeaders(headers, now = Date.now()) {
 }
 
 /**
- * The model list this provider declares at registration: the offline fallback, one
- * documented model at the configured rates. It is what makes a LithosAI model loadable
- * before any key exists — the live catalogue, ids discovered from `/models` at these same
- * rates, arrives through `fetchDynamicModels` once the provider is authenticated.
+ * One model registration entry. Static and discovered models go through here so the same id
+ * is the same entry either way: omp merges the two by id, and a name that changed with the
+ * source would rename a model under the user every time discovery succeeded.
  */
-export function lithosModels(rates) {
-	return [
-		{
-			id: LITHOS_DEFAULT_MODEL,
-			name: "Kimi K3 on LithosAI",
-			reasoning: true,
-			input: ["text"],
-			cost: { input: rates.input, output: rates.output, cacheRead: rates.cached, cacheWrite: 0 },
-			contextWindow: LITHOS_CONTEXT_WINDOW,
-			maxTokens: LITHOS_MAX_TOKENS,
-		},
-	];
-}
-
-/** Models a live `/models` call reports, at the configured rates. */
-function discoveredModels(ids, rates) {
-	return ids.map((id) => ({
+function modelSpec(id, rates) {
+	const known = LITHOS_CATALOGUE.find((entry) => entry.id === id);
+	return {
 		id,
-		name: `${id} on LithosAI`,
+		name: `${known?.name ?? id} on LithosAI`,
 		reasoning: true,
 		input: ["text"],
 		cost: { input: rates.input, output: rates.output, cacheRead: rates.cached, cacheWrite: 0 },
 		contextWindow: LITHOS_CONTEXT_WINDOW,
 		maxTokens: LITHOS_MAX_TOKENS,
-	}));
+	};
+}
+
+/**
+ * The model list this provider declares at registration: the whole catalogue, one entry per
+ * model LithosAI serves. It is what makes every LithosAI model loadable before any key
+ * exists; the live catalogue, ids discovered from `/models` at these same rates, arrives
+ * through `fetchDynamicModels` once the provider is authenticated.
+ */
+export function lithosModels(rates) {
+	return LITHOS_CATALOGUE.map((entry) => modelSpec(entry.id, rates));
+}
+
+/** Models a live `/models` call reports, at the configured rates. */
+function discoveredModels(ids, rates) {
+	return ids.map((id) => modelSpec(id, rates));
 }
 
 /**
@@ -242,6 +255,8 @@ export function installLithos(pi, shell) {
 		/** Output tokens per second, one sample per completed response. */
 		speeds: [],
 		requests: 0,
+		/** Last `/models` outcome: `{ at, ids }` on a 200, `{ at, error }` on a failure. */
+		discovery: undefined,
 		/** What the provider was last registered with, so a config change re-registers. */
 		registered: undefined,
 	};
@@ -276,9 +291,14 @@ export function installLithos(pi, shell) {
 				// A refusal throws rather than returning an empty list, and the difference is
 				// deliberate: omp reads a rejected discovery fetch as "keep the cached catalogue
 				// and try again", while a successful-but-empty `/models` is authoritative for
-				// this cycle and clears it.
+				// this cycle and clears it. Both outcomes are kept for `/mega lithos`, which is
+				// where the bundled catalogue explains itself.
 				const checked = await validateKey(apiKey, { baseUrl: url });
-				if (!checked.ok) throw new Error(`LithosAI /models failed: ${checked.error}`);
+				if (!checked.ok) {
+					state.discovery = { at: Date.now(), error: checked.error };
+					throw new Error(`LithosAI /models failed: ${checked.error}`);
+				}
+				state.discovery = { at: Date.now(), ids: checked.models };
 				return discoveredModels(checked.models, currentRates);
 			},
 			oauth: {
@@ -389,6 +409,22 @@ export function installLithos(pi, shell) {
 		state.requests = 0;
 	}
 
+	/**
+	 * The last `/models` outcome, in one line: when it answered, what it served and which of
+	 * those ids the bundled catalogue does not know; when it did not, why — because "the
+	 * picker shows the bundled list" is a fact the user has to be able to explain.
+	 */
+	function discoveryLine() {
+		const seen = state.discovery;
+		if (!seen) return "not fetched yet — omp asks once the provider has a key";
+		const at = new Date(seen.at).toISOString().slice(11, 19);
+		if (seen.error) return `unreachable at ${at} UTC — ${seen.error}; \`/model\` offers the bundled catalogue`;
+		const bundled = new Set(LITHOS_CATALOGUE.map((entry) => entry.id));
+		const fresh = seen.ids.filter((id) => !bundled.has(id));
+		const served = `${seen.ids.length} model(s) at ${at} UTC`;
+		return fresh.length > 0 ? `${served}, new: ${fresh.map((id) => `\`${id}\``).join(", ")}` : `${served}, all in the bundled catalogue`;
+	}
+
 	/** One row segment: measured speed, the remaining per-minute budgets, and any refusal. */
 	function segment() {
 		if (!values().enabled || !values()["lithos.enabled"] || !isLithos(state.ctx)) return undefined;
@@ -415,6 +451,8 @@ export function installLithos(pi, shell) {
 		const model = activeModel(ctx);
 		const lines = ["### LithosAI", ""];
 		lines.push(`- Endpoint: \`${baseUrl()}\``);
+		lines.push(`- Bundled catalogue: ${LITHOS_CATALOGUE.map((entry) => `\`${entry.id}\``).join(", ")}`);
+		lines.push(`- Live \`/models\`: ${discoveryLine()}`);
 		if (!isLithos(ctx)) {
 			lines.push(`- No LithosAI model is active (current: \`${model?.provider ?? "none"}/${model?.id ?? "none"}\`).`);
 			lines.push(

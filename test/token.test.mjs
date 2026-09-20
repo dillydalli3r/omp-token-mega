@@ -478,7 +478,7 @@ await test("results below minChars, above maxScanBytes, or out of scope are left
 		const host = await makeHost();
 		await host.start();
 		assert.equal((await host.toolResult("x   \n".repeat(2000))).length, 0, "out of scope");
-		await host.commands.get("mega").handler("", host.ctx);
+		await host.commands.get("mega").handler("report", host.ctx);
 		assert.match(String(host.messages.at(-1).content), /1 out of scope/);
 	});
 });
@@ -563,7 +563,7 @@ await test("counters, report, config, audit and preset all render", async () => 
 		await host.start();
 		await host.emit("tool_execution_start", { toolExecutionId: "1", toolCallId: "1", toolName: "bash", args: {} });
 		await host.toolResult(`${"noise   \n".repeat(500)}`);
-		for (const sub of ["", "status", "config", "audit", "preset", "preset max", "reset", "help"]) {
+		for (const sub of ["report", "status", "config", "audit", "preset", "preset max", "reset", "help"]) {
 			await host.commands.get("mega").handler(sub, host.ctx);
 		}
 		const rendered = host.messages.map((message) => String(message.content)).join("\n");

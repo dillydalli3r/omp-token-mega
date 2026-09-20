@@ -16,18 +16,22 @@
  * text and would flatten the peak/off-peak tint (see ./status.js); segments that do not fit
  * the configured width are dropped whole.
  *
- *   /mega                  report: token saving, cache, balance — one document
+ *   /mega                  the menu: report, status, settings, preset, audit, cache, balance
+ *   /mega report           one document: token saving, cache, LithosAI, balance
  *   /mega status           the status row, as text
- *   /mega config           all thirty settings, their values and the layer that supplied each
+ *   /mega config           all settings, their values and the layer that supplied each
  *   /mega config reset     drop stored settings so the defaults apply again
- *   /mega menu             interactive settings editor, grouped by feature
+ *   /mega menu             the menu spelled out (a bare /mega opens it too)
  *   /mega preset [name]    list or switch the token-saving preset bundle
  *   /mega audit            where this session's input tokens go, and which omp knobs to change
  *   /mega cache [doctor|fix|rollback]   cache section, or compat-key repair
- *   /mega lithos           LithosAI speed, per-minute budgets and spend
+ *   /mega lithos           LithosAI catalogue, speed, per-minute budgets and spend
  *   /mega balance          account balance and the session spend table
  *   /mega reset            zero this session's counters
  *   tool `deepseek_balance`  the same figures for the model itself
+ *
+ * The menu and the subcommands are the same code: each entry calls the action the
+ * subcommand calls, so nothing is reachable one way but not the other.
  *
  * Settings come from `omp plugin config` (global, plus `.omp/plugin-overrides.json` per
  * project), a preset bundle and environment fallbacks; see ./config.js.
@@ -48,7 +52,7 @@ import {
 } from "./config.js";
 import { composeRow, renderRow, themeTint } from "./status.js";
 import { megaReport } from "./report.js";
-import { configMenu, menuFallback, writeSetting } from "./menu.js";
+import { megaHub, menuFallback, settingsMenu, writeSetting } from "./menu.js";
 import { installToken } from "./token.js";
 import { installCache } from "./cache.js";
 import { installBalance } from "./balance.js";
@@ -271,42 +275,178 @@ export default function tokenMega(pi) {
 		});
 	}
 
+	/**
+	 * One action per thing the command can do, each the single implementation of it: the
+	 * subcommands and the menu both call these, so an action cannot mean two things
+	 * depending on how it was reached.
+	 */
+	function showStatus(ctx) {
+		const rows = enabled() && values().statusRow === true ? row() : undefined;
+		const line = renderRow(rows, { width: values().statusMaxChars });
+		ctx.ui.notify(line ?? (enabled() ? "No metrics yet." : "Token Mega is disabled (`enabled`)."), "info");
+	}
+
+	async function showConfig(ctx) {
+		// Re-read before printing: settings are otherwise read once per session.
+		say(formatConfig(await reload(ctx)));
+		render();
+	}
+
+	async function showAudit(ctx) {
+		await reload(ctx);
+		try {
+			say(await features.token.audit(ctx));
+		} catch (error) {
+			// The audit is a diagnostic; it must report its own failure rather than take down
+			// the session or fail silently in a mode with fewer surfaces.
+			ctx.ui.notify(`Audit failed: ${error?.message ?? error}`, "error");
+		}
+	}
+
+	async function showCache(ctx, action = "report") {
+		if (action === "report") {
+			say(await features.cache.section(ctx));
+			return;
+		}
+		if (action === "doctor") {
+			say(await features.cache.doctor(ctx));
+			return;
+		}
+		if (action === "fix" || action === "rollback") {
+			const outcome = action === "fix" ? await features.cache.repair(ctx) : await features.cache.undo(ctx);
+			ctx.ui.notify(outcome.message, outcome.level);
+			return;
+		}
+		ctx.ui.notify("Usage: `/mega cache [report|doctor|fix|rollback]`.", "error");
+	}
+
+	/** Apply a preset through omp's CLI, then report which layer actually supplies it. */
+	async function applyPreset(ctx, name) {
+		const written = await writeSetting(pi, config().name, "token.preset", name);
+		const applied = await reload(ctx);
+		const shadowed = applied.sources["token.preset"] !== "global" || applied.values["token.preset"] !== name;
+		ctx.ui.notify(
+			written.ok
+				? `Preset '${name}' selected${shadowed ? ` — but '${applied.values["token.preset"]}' from ${applied.sources["token.preset"]} wins` : ""} (${Object.keys(presetValues(name)).length} keys).`
+				: `Could not write the setting${written.because ? ` (${written.because})` : ""}. Run: ${written.hint}`,
+			written.ok ? "info" : "error",
+		);
+		render();
+	}
+
+	async function resetCounters(ctx) {
+		features.token.reset();
+		features.lithos.reset();
+		features.balance.reset();
+		await features.cache.reset(ctx);
+		render();
+		ctx.ui.notify("Counters reset for this session.", "info");
+	}
+
+	/** The cache actions the menu offers, label and subcommand paired. */
+	const CACHE_ACTIONS = [
+		["report", "Report — the cache section"],
+		["doctor", "Doctor — scan the model config for inert compat keys"],
+		["fix", "Repair — remove the inert keys (writes a backup first)"],
+		["rollback", "Rollback — undo the last repair"],
+	];
+
+	/**
+	 * The hub. Every subcommand appears here, so the menu is a complete interface rather
+	 * than a shortcut to four of them, and the labels carry the live value where one exists
+	 * (the preset, the balance) so the menu itself answers the common question.
+	 */
+	function hubActions(ctx) {
+		return [
+			{ label: "Report — token saving, cache, LithosAI, balance", run: async () => say(await fullReport(ctx)) },
+			{ label: "Status row — as text", run: () => showStatus(ctx) },
+			{ label: "Settings — pick a group and edit", run: () => settingsMenu({ pi, ctx, reload: () => reload(ctx) }) },
+			{ label: `Token preset — currently ${config().preset}`, run: () => pickPreset(ctx) },
+			{ label: "Settings as text — every key, value and source", run: () => showConfig(ctx) },
+			{ label: "Token audit — request envelope and omp knobs", run: () => showAudit(ctx) },
+			{ label: "Cache — report, doctor, repair, rollback", run: () => pickCache(ctx) },
+			{ label: "LithosAI — models, speed, budgets, spend", run: () => say(features.lithos.section(ctx)) },
+			{ label: "DeepSeek balance — account and session spend", run: async () => say(await features.balance.section(ctx)) },
+			{ label: "Reset counters — zero this session", run: () => resetCounters(ctx) },
+		];
+	}
+
+	async function pickPreset(ctx) {
+		await reload(ctx);
+		const choice = await ctx.ui.select(`Token preset — currently ${config().preset}`, [...PRESET_NAMES, "Back"]);
+		if (!choice || choice === "Back") return;
+		await applyPreset(ctx, choice);
+	}
+
+	async function pickCache(ctx) {
+		const labels = CACHE_ACTIONS.map(([, label]) => label);
+		const choice = await ctx.ui.select("Cache — pick an action", [...labels, "Back"]);
+		if (!choice || choice === "Back") return;
+		const picked = CACHE_ACTIONS[labels.indexOf(choice)];
+		if (picked) await showCache(ctx, picked[0]);
+	}
+
+	/** The hub, with a dialog host that cannot answer turned into a message rather than a hang. */
+	async function openHub(ctx) {
+		try {
+			await megaHub({ ctx, actions: hubActions(ctx) });
+		} catch (error) {
+			ctx.ui.notify(`Menu failed: ${error?.message ?? error}. Use /mega help for the subcommands.`, "error");
+		}
+		render();
+	}
+
+	const HELP = [
+		"### Token Mega",
+		"",
+		"- `/mega` — the menu: report, settings, preset, audit, cache, balance",
+		"- `/mega report` — one document: token saving, prefix cache, LithosAI, account",
+		"- `/mega status` — the one-line status row, as text",
+		"- `/mega config` — all settings, their values and sources",
+		"- `/mega config reset [key] [global|project]` — drop stored settings",
+		"- `/mega menu` — the menu, spelled out",
+		`- \`/mega preset [${PRESET_NAMES.join("|")}]\` — show or switch the token-saving bundle`,
+		"- `/mega audit` — request-envelope token audit and omp knob advice",
+		"- `/mega cache [doctor|fix|rollback]` — cache section, or compat-key repair",
+		"- `/mega lithos` — LithosAI: catalogue, speed, per-minute budgets, session spend",
+		"- `/mega balance` — DeepSeek account balance and the session spend table",
+		"- `/mega reset` — zero this session's counters",
+	].join("\n");
+
 	pi.registerCommand("mega", {
-		description: "Token Mega: savings report, cache accounting, balance, settings menu and audit",
+		description: "Token Mega: the menu, the savings report, cache accounting, balance and audit",
 		handler: async (args, ctx) => {
 			state.ctx = ctx;
 			const parts = String(args ?? "")
 				.trim()
 				.split(/\s+/)
 				.filter(Boolean);
-			const sub = parts[0] ?? "report";
+			const sub = parts[0];
 			const rest = parts.slice(1).join(" ");
 
-			if (sub === "status") {
-				const rows = enabled() && values().statusRow === true ? row() : undefined;
-				const line = renderRow(rows, { width: values().statusMaxChars });
-				ctx.ui.notify(line ?? (enabled() ? "No metrics yet." : "Token Mega is disabled (`enabled`)."), "info");
+			// Bare `/mega` is the menu: one keystroke, every action. A host with no dialogs
+			// cannot be asked anything, so it gets the report the menu's first entry shows.
+			if (sub === undefined) {
+				if (!ctx.hasUI) {
+					say(await fullReport(ctx));
+					return;
+				}
+				await openHub(ctx);
 				return;
 			}
 
 			if (sub === "help") {
-				say(
-					[
-						"### Token Mega",
-						"",
-						"- `/mega` — one report: token saving, prefix cache, account",
-						"- `/mega status` — the one-line status row, as text",
-						"- `/mega config` — all settings, their values and sources",
-						"- `/mega config reset [key] [global|project]` — drop stored settings",
-						"- `/mega menu` — interactive settings editor",
-						`- \`/mega preset [${PRESET_NAMES.join("|")}]\` — show or switch the token-saving bundle`,
-						"- `/mega audit` — request-envelope token audit and omp knob advice",
-						"- `/mega cache [doctor|fix|rollback]` — cache section, or compat-key repair",
-						"- `/mega lithos` — LithosAI: speed, per-minute budgets, session spend",
-						"- `/mega balance` — DeepSeek account balance and the session spend table",
-						"- `/mega reset` — zero this session's counters",
-					].join("\n"),
-				);
+				say(HELP);
+				return;
+			}
+
+			if (sub === "report") {
+				say(await fullReport(ctx));
+				return;
+			}
+
+			if (sub === "status") {
+				showStatus(ctx);
 				return;
 			}
 
@@ -323,26 +463,16 @@ export default function tokenMega(pi) {
 					);
 					return;
 				}
-				// Re-read before printing: settings are otherwise read once per session.
-				say(formatConfig(await reload(ctx)));
-				render();
+				await showConfig(ctx);
 				return;
 			}
 
 			if (sub === "menu") {
-				const applied = await reload(ctx);
 				if (!ctx.hasUI) {
-					say(menuFallback(applied));
+					say(menuFallback(await reload(ctx)));
 					return;
 				}
-				try {
-					await configMenu({ pi, ctx, reload: () => reload(ctx) });
-				} catch (error) {
-					// A dialog host that cannot answer must not leave the command hanging with
-					// nothing said: name the failure and point at the non-interactive surface.
-					ctx.ui.notify(`Menu failed: ${error?.message ?? error}. Use /mega config for the values.`, "error");
-				}
-				render();
+				await openHub(ctx);
 				return;
 			}
 
@@ -356,52 +486,17 @@ export default function tokenMega(pi) {
 					ctx.ui.notify(`Unknown preset '${rest}'. One of: ${PRESET_NAMES.join(", ")}.`, "error");
 					return;
 				}
-				const written = await writeSetting(pi, config().name, "token.preset", rest);
-				const applied = await reload(ctx);
-				const shadowed = applied.sources["token.preset"] !== "global" || applied.values["token.preset"] !== rest;
-				ctx.ui.notify(
-					written.ok
-						? `Preset '${rest}' selected${shadowed ? ` — but '${applied.values["token.preset"]}' from ${applied.sources["token.preset"]} wins` : ""} (${Object.keys(presetValues(rest)).length} keys).`
-						: `Could not write the setting${written.because ? ` (${written.because})` : ""}. Run: ${written.hint}`,
-					written.ok ? "info" : "error",
-				);
-				render();
+				await applyPreset(ctx, rest);
 				return;
 			}
 
 			if (sub === "audit") {
-				await reload(ctx);
-				try {
-					say(await features.token.audit(ctx));
-				} catch (error) {
-					// The audit is a diagnostic; it must report its own failure rather than
-					// take down the session or fail silently in a mode with fewer surfaces.
-					ctx.ui.notify(`Audit failed: ${error?.message ?? error}`, "error");
-				}
+				await showAudit(ctx);
 				return;
 			}
 
 			if (sub === "cache") {
-				const action = parts[1] ?? "report";
-				if (action === "doctor") {
-					say(await features.cache.doctor(ctx));
-					return;
-				}
-				if (action === "fix") {
-					const outcome = await features.cache.repair(ctx);
-					ctx.ui.notify(outcome.message, outcome.level);
-					return;
-				}
-				if (action === "rollback") {
-					const outcome = await features.cache.undo(ctx);
-					ctx.ui.notify(outcome.message, outcome.level);
-					return;
-				}
-				if (action !== "report") {
-					ctx.ui.notify("Usage: `/mega cache [report|doctor|fix|rollback]`.", "error");
-					return;
-				}
-				say(await features.cache.section(ctx));
+				await showCache(ctx, parts[1] ?? "report");
 				return;
 			}
 
@@ -416,12 +511,7 @@ export default function tokenMega(pi) {
 			}
 
 			if (sub === "reset") {
-				features.token.reset();
-				features.lithos.reset();
-				features.balance.reset();
-				await features.cache.reset(ctx);
-				render();
-				ctx.ui.notify("Counters reset for this session.", "info");
+				await resetCounters(ctx);
 				return;
 			}
 

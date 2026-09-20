@@ -117,9 +117,68 @@ function clockTime(minute) {
 	return `${String(Math.floor(minute / 60)).padStart(2, "0")}:${String(minute % 60).padStart(2, "0")}`;
 }
 
-/** The window's own bounds: `01:00\u201304:00Z`. */
+/** The window's own bounds in the schedule's frame: `01:00\u201304:00Z`. */
 function windowRange(window) {
 	return `${clockTime(window.startMinute)}\u2013${clockTime(window.endMinute)}Z`;
+}
+
+/**
+ * One occurrence of a window as absolute UTC milliseconds.
+ *
+ * `dayOffset` is relative to the clock's UTC day, which the caller resolves — the occurrence
+ * in force may have opened the previous day when the window crosses midnight. A window whose
+ * end is not after its start is exactly that crossing case, so its end lands on the next day;
+ * an end of 1440 is midnight and stays on the start's day.
+ */
+function windowSpan(clock, window, dayOffset) {
+	const startDay = clock.day + dayOffset;
+	const endDay = startDay + (window.endMinute > window.startMinute ? 0 : 1);
+	const instant = (day, minute) => (day * 1440 + minute) * 60_000;
+	return { start: instant(startDay, window.startMinute), end: instant(endDay, window.endMinute) };
+}
+
+/** One formatter per zone: building these is the expensive part of every label. */
+const LOCAL_FORMATS = new Map();
+
+function localParts(at, timeZone) {
+	const key = timeZone ?? "";
+	let format = LOCAL_FORMATS.get(key);
+	if (!format) {
+		format = new Intl.DateTimeFormat("en-US", {
+			year: "numeric",
+			month: "2-digit",
+			day: "2-digit",
+			hour: "2-digit",
+			minute: "2-digit",
+			hourCycle: "h23",
+			timeZoneName: "short",
+			...(timeZone === undefined ? {} : { timeZone }),
+		});
+		LOCAL_FORMATS.set(key, format);
+	}
+	const parts = format.formatToParts(at);
+	const get = (type) => parts.find((part) => part.type === type)?.value ?? "";
+	return {
+		stamp: `${get("year")}-${get("month")}-${get("day")} ${get("hour")}:${get("minute")}`,
+		zone: get("timeZoneName"),
+	};
+}
+
+/**
+ * A span as local wall-clock times, dated, with the zone in force:
+ * `2026-09-20 21:00\u20132026-09-21 00:00 EDT`.
+ *
+ * The schedule is declared in UTC and priced in UTC, but the person reading the row lives in
+ * a zone: a window that reads 01:00\u201304:00Z is 21:00\u201300:00 the evening before wherever the
+ * offset is \u22124, and the same window is an hour different once the zone changes offset. Dates
+ * are part of the label because a window can open days later, and because the local dates of
+ * its bounds need not be the same day at all.
+ */
+function localRange(span, timeZone) {
+	const from = localParts(span.start, timeZone);
+	const to = localParts(span.end, timeZone);
+	const zone = from.zone === to.zone ? from.zone : `${from.zone}\u2013${to.zone}`;
+	return `${from.stamp}\u2013${to.stamp} ${zone}`.trim();
 }
 
 /**
@@ -145,21 +204,41 @@ function nextWindow({ schedule, weekday, minute }) {
  * The tariff period as a status-row label, or `undefined` when the model prices both periods
  * the same (or declares no schedule) — a label for an unchanged rate is noise.
  *
- * The label carries a whole window rather than a countdown to the next boundary because the
- * user asked when peak starts and ends: `peak` names the window the current minute sits in,
- * off peak names the next one, with the weekday prefixed only when that window does not open
- * today. A discounted schedule whose windows never match still reports `off-peak` — the rate
- * really is discounted, there is simply no window to promise.
+ * `text` is the row's form: the window in local time, dated, with the zone in force, because
+ * that is the reading a user can act on. `detail` adds the schedule's own UTC frame for the
+ * report, where there is room for both and the UTC reading is what the rate card declares.
+ * `timeZone` is an IANA zone for tests; the row uses the machine's zone.
+ *
+ * On peak, the label names the window the current minute sits in — its start may be on the
+ * previous local day when the window crosses local midnight. Off peak, it names the next one,
+ * which can open up to a week later, so that label carries its date rather than a weekday
+ * name: a date answers "when" and also "which day is that". A discounted schedule whose
+ * windows never match still reports `off-peak` — the rate really is discounted, there is
+ * simply no window to promise.
  */
-export function peakLabel(model, at = Date.now()) {
+export function peakLabel(model, at = Date.now(), timeZone) {
 	const clock = peakClock(model, at);
 	if (!clock || discountMultiplier(clock.schedule) === undefined) return undefined;
 	const open = windowAt(clock);
-	if (open) return { period: "peak", text: `peak ${windowRange(open)}` };
+	if (open) {
+		// `windowAt` matched the current minute against `[start, end)` on the clock's own UTC
+		// day (the rule omp prices by), so the occurrence in force opened earlier today.
+		const span = windowSpan(clock, open, 0);
+		return {
+			period: "peak",
+			text: `peak ${localRange(span, timeZone)}`,
+			detail: `${windowRange(open)} = ${localRange(span, timeZone)}`,
+		};
+	}
 	const next = nextWindow(clock);
-	if (!next) return { period: "off-peak", text: "off-peak" };
-	const day = next.dayOffset === 0 ? "" : `${WEEKDAYS[next.weekday]} `;
-	return { period: "off-peak", text: `off-peak (peak ${day}${windowRange(next.window)})` };
+	if (!next) return { period: "off-peak", text: "off-peak", detail: "peak windows are not scheduled" };
+	const span = windowSpan(clock, next.window, next.dayOffset);
+	const local = localRange(span, timeZone);
+	return {
+		period: "off-peak",
+		text: `off-peak, peak ${local}`,
+		detail: `peak ${WEEKDAYS[next.weekday]} ${windowRange(next.window)} = ${local}`,
+	};
 }
 
 /**

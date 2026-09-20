@@ -77,17 +77,23 @@ async function editKey({ pi, ctx, config, key }) {
 	return { changed: true, cleared, value: next };
 }
 
-/** `/mega menu` — pick a group, then a key inside it. */
-export async function configMenu({ pi, ctx, reload }) {
+/**
+ * The settings submenu: pick a group, then a key inside it, and edit in place.
+ *
+ * The group list carries how many keys are set, so a non-default layer is visible before
+ * opening a group. `Done` returns to the hub, which is why this is a submenu rather than the
+ * whole command.
+ */
+export async function settingsMenu({ pi, ctx, reload }) {
 	for (;;) {
 		let config = await reload();
 		const groupOptions = KEY_GROUPS.map((group) => {
 			const changed = group.keys.filter((key) => config.sources[key] !== "default").length;
 			return `${group.label} — ${group.keys.length} setting(s)${changed > 0 ? `, ${changed} set` : ""}`;
 		});
-		const options = [...groupOptions, "Reset stored settings…", "Done"];
+		const options = [...groupOptions, "Reset stored settings…", "Back"];
 		const choice = await ctx.ui.select("Token Mega settings — pick a group", options);
-		if (!choice || choice === "Done") return;
+		if (!choice || choice === "Back") return;
 
 		if (choice === "Reset stored settings…") {
 			const confirmed = await ctx.ui.confirm(
@@ -129,6 +135,27 @@ export async function configMenu({ pi, ctx, reload }) {
 				"info",
 			);
 		}
+	}
+}
+
+/**
+ * `/mega` — the one menu.
+ *
+ * Every entry the command had as a subcommand is an action here, so the settings are
+ * editable and the reports readable without remembering a syntax; the subcommands keep
+ * working for scripting and for hosts without dialogs. An action that has more than a
+ * handful of outcomes (settings, preset, cache) opens its own submenu, and everything
+ * returns here rather than exiting, because a menu that closes after one edit makes the
+ * second edit a re-type.
+ */
+export async function megaHub({ ctx, actions }) {
+	for (;;) {
+		const labels = actions.map((action) => action.label);
+		const choice = await ctx.ui.select("Token Mega — pick an action", [...labels, "Done"]);
+		if (!choice || choice === "Done") return;
+		const action = actions[labels.indexOf(choice)];
+		if (!action) continue;
+		await action.run();
 	}
 }
 

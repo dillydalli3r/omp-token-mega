@@ -16,7 +16,7 @@ import { homedir } from "node:os";
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { activeModel, modelKey } from "./model.js";
-import { cacheSavings, cacheStats, isDeepSeek, peakLabel, priceMultiplier, pricePeriod } from "./deepseek.js";
+import { cacheSavings, cacheStats, isDeepSeek, peakLabel, priceMultiplier } from "./deepseek.js";
 import { MISS_REASONS, attributeMiss, driftNote, fingerprint, toolsFingerprint } from "./prefix.js";
 import {
 	addTotals,
@@ -207,7 +207,9 @@ export function installCache(pi, shell) {
 		const model = activeModel(ctx);
 		const subagentsEnabled = values()["cache.subagents"] === true;
 		const now = Date.now();
-		const period = pricePeriod(model, now);
+		// The tariff in force, plus the window it is priced by: the schedule's own UTC bounds
+		// and the same window in the reader's zone, dated.
+		const tariff = peakLabel(model, now);
 
 		lines.push("### DeepSeek prefix cache", "");
 		if (!isDeepSeek(ctx)) {
@@ -225,10 +227,11 @@ export function installCache(pi, shell) {
 		lines.push(`- Session cost: $${total.costUsd.toFixed(6)}`);
 		lines.push(`- Saved by cache reads: $${total.savedUsd.toFixed(6)}`);
 		if (total.hitRate !== undefined) lines.push(`- Token-weighted hit rate: ${(total.hitRate * 100).toFixed(1)}%`);
-		if (period) {
+		if (tariff) {
 			const multiplier = priceMultiplier(model, now);
+			const which = tariff.period === "peak" ? "window in force" : "next window";
 			lines.push(
-				`- Price period: ${period}${multiplier === 1 ? "" : ` (rates ×${multiplier}, so savings are discounted the same way)`}`,
+				`- Price period: ${tariff.period}${multiplier === 1 ? "" : ` (rates ×${multiplier}, so savings are discounted the same way)`} — ${which}: ${tariff.detail}`,
 			);
 		}
 

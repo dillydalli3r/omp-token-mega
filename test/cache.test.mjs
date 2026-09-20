@@ -200,20 +200,52 @@ const TOOLS_A = [{ function: { name: "bash" } }, { function: { name: "read" } }]
 	);
 
 	// The label names the window whose bounds bracket the state: the user asked when peak
-	// starts and ends, not how long is left of it.
-	const label = (at) => peakLabel(MODEL_SCHEDULED, at);
+	// starts and ends, not how long is left of it. Times are the reader's zone, dated, and
+	// the zone is named explicitly (`EDT`/`EST`), because a UTC window lands on the previous
+	// local day whenever the offset pushes it across midnight. The zone is pinned here so a
+	// machine in another one cannot decide the expected string.
+	const ZONE = "America/New_York";
+	const label = (at) => peakLabel(MODEL_SCHEDULED, at, ZONE);
 	expect(
-		"peak label names the window in force",
-		label(peak)?.period === "peak" && label(peak)?.text === "peak 01:00\u201304:00Z",
+		"peak label names the window in force, in the reader's zone",
+		label(peak)?.period === "peak" && label(peak)?.text === "peak 2026-09-15 21:00\u20132026-09-16 00:00 EDT",
 		label(peak),
 	);
+	expect("peak label keeps the schedule's own frame for the report", label(peak)?.detail === "01:00\u201304:00Z = 2026-09-15 21:00\u20132026-09-16 00:00 EDT", label(peak));
 	expect(
-		"off-peak label names today's next window without a weekday",
-		label(early)?.text === "off-peak (peak 06:00\u201310:00Z)",
+		"off-peak label names the next window with its date",
+		label(early)?.text === "off-peak, peak 2026-09-16 02:00\u20132026-09-16 06:00 EDT",
 		label(early),
 	);
-	expect("off-peak label names tomorrow's window", label(midday)?.text === "off-peak (peak Thu 01:00\u201304:00Z)", label(midday));
-	expect("off-peak label crosses the weekend to Monday", label(weekend)?.text === "off-peak (peak Mon 01:00\u201304:00Z)", label(weekend));
+	expect(
+		"off-peak label dates the window that opens on a later day",
+		label(midday)?.text === "off-peak, peak 2026-09-16 21:00\u20132026-09-17 00:00 EDT",
+		label(midday),
+	);
+	expect(
+		"off-peak label crosses the weekend to Monday",
+		label(weekend)?.text === "off-peak, peak 2026-09-20 21:00\u20132026-09-21 00:00 EDT",
+		label(weekend),
+	);
+	expect("off-peak detail names the weekday of the UTC window", label(weekend)?.detail === "peak Mon 01:00\u201304:00Z = 2026-09-20 21:00\u20132026-09-21 00:00 EDT", label(weekend));
+
+	// The same UTC window, read in January: the zone changed offset, so the times and the
+	// zone name must change with it. A label that hard-coded EST would be an hour wrong all
+	// summer, and one that hard-coded EDT an hour wrong all winter.
+	const winter = Date.UTC(2027, 0, 13, 2, 0, 0); // Wednesday 02:00 UTC
+	expect(
+		"winter reads EST at the shifted offset",
+		peakLabel(MODEL_SCHEDULED, winter, ZONE)?.text === "peak 2027-01-12 20:00\u20132027-01-12 23:00 EST",
+		peakLabel(MODEL_SCHEDULED, winter, ZONE),
+	);
+	// With no zone given, the label is the machine's — same string as passing its own zone,
+	// so the row can never print a zone other than the one the reader lives in.
+	expect(
+		"omitting the zone reads the machine's zone",
+		label(peak) === undefined ||
+			peakLabel(MODEL_SCHEDULED, peak)?.text === peakLabel(MODEL_SCHEDULED, peak, Intl.DateTimeFormat().resolvedOptions().timeZone)?.text,
+		peakLabel(MODEL_SCHEDULED, peak)?.text,
+	);
 
 	// A schedule that bills both periods the same is not a tariff: with no difference to
 	// report there is no period, no label, and the row must not claim a discount.
@@ -260,7 +292,13 @@ const TOOLS_A = [{ function: { name: "bash" } }, { function: { name: "read" } }]
 	await h.fire("session_shutdown", {});
 	const [shard] = await Promise.all((await h.shardFiles()).map((name) => readJson(join(h.shardsDir, name))));
 	expect("recorded savings use the off-peak card", Math.abs(shard.totals.savedUsd - million(weekend)) < 1e-12, shard.totals.savedUsd);
-	expect("the status row names the period and its window", periodRow.includes("off-peak (peak Mon 01:00\u201304:00Z)"), periodRow);
+	// The row's own zone decides the local reading, so its shape is what is pinned here; the
+	// exact string is pinned against a named zone above.
+	expect(
+		"the status row names the period and the dated window it waits for",
+		/\boff-peak, peak \d{4}-\d{2}-\d{2} \d{2}:\d{2}\u2013\d{4}-\d{2}-\d{2} \d{2}:\d{2} [A-Z]{2,5}\b/.test(periodRow),
+		periodRow,
+	);
 }
 
 // ---------------------------------------------------------------- session-wide metrics
@@ -299,7 +337,7 @@ const TOOLS_A = [{ function: { name: "bash" } }, { function: { name: "read" } }]
 	// Main alone is 19,700 / 29,700 = 66%; the child lifts the session figure to 92%.
 	expect("status row hit rate is the session figure", /DS cache 92%/.test(row), row);
 
-	await h.command().handler("", h.ctx);
+	await h.command().handler("report", h.ctx);
 	const report = h.messages.at(-1)?.content ?? "";
 	expect("report headline is session-wide", report.includes("- Requests: 5 (4 with a cache hit)"), report.slice(0, 400));
 	expect("report names the scope", report.includes("plus 1 subagent session(s)"), report.slice(0, 400));
@@ -536,7 +574,7 @@ expect("child session resolves the same agent dir", resolveAgentDir(childCtx) ==
 
 	const noAgents = await makeHarness({ settings: { "@dillydalli3r/omp-token-mega": { "cache.subagents": false } } });
 	await noAgents.fire("before_agent_start", { systemPrompt: ["you are omp"] });
-	await noAgents.command().handler("", noAgents.ctx);
+	await noAgents.command().handler("report", noAgents.ctx);
 	expect(
 		"subagents off is stated in the report",
 		(noAgents.messages.at(-1)?.content ?? "").includes("`cache.subagents` is off"),
@@ -724,7 +762,7 @@ expect("child session resolves the same agent dir", resolveAgentDir(childCtx) ==
 	await command.handler("status", h.ctx);
 	expect("status subcommand notifies", /DS cache/.test(h.notices.at(-1) ?? ""), h.notices.at(-1));
 
-	await command.handler("", h.ctx);
+	await command.handler("report", h.ctx);
 	const report = h.messages.at(-1)?.content ?? "";
 	expect("report rendered", report.includes("### DeepSeek prefix cache"), report.slice(0, 80));
 	expect("report has a breakdown section", report.includes("#### Breakdown"));

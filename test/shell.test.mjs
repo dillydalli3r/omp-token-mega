@@ -161,13 +161,17 @@ await withConfig({ statusSegments: "nope" }, async () => {
 		}
 	};
 
+	// The window itself is pinned string-exact in the pricing suite, which names its zone;
+	// here the row has to name a dated, zoned window without this suite's own zone deciding
+	// the string, so the shape is what is checked.
+	const WINDOW = /\bpeak \d{4}-\d{2}-\d{2} \d{2}:\d{2}\u2013\d{4}-\d{2}-\d{2} \d{2}:\d{2} [A-Z]{2,5}\b/;
 	const peak = await rowAt(SCHEDULED_MODEL, peakAt);
-	expect("tint: a peak row names the window it is in", peak.row?.includes("peak 01:00\u201304:00Z"), peak.row);
+	expect("tint: a peak row names the window it is in, dated and zoned", WINDOW.test(peak.row ?? ""), peak.row);
 	expect("tint: a peak-priced row is drawn red", peak.tint?.includes("\u001b[31mpeak "), peak.tint);
 	expect("tint: the host's plain row is the tinted row without its escapes", Boolean(peak.row) && strip(peak.tint ?? "") === peak.row, peak.row);
 
 	const offPeak = await rowAt(SCHEDULED_MODEL, offPeakAt);
-	expect("tint: an off-peak row names the peak window it waits for", offPeak.row?.includes("off-peak (peak "), offPeak.row);
+	expect("tint: an off-peak row names the peak window it waits for", /\boff-peak, peak \d{4}-\d{2}-\d{2} /.test(offPeak.row ?? ""), offPeak.row);
 	expect("tint: an off-peak row is drawn green", offPeak.tint?.includes("\u001b[32moff-peak"), offPeak.tint);
 
 	// A model with no declared schedule has one price all day: both periods cost the same,
@@ -242,9 +246,11 @@ await withConfig({}, async () => {
 	const host = await makeHost({
 		model: DEEPSEEK_MODEL,
 		answers: {
-			// Group "LithosAI", then the base URL key, then a new value. The key is found by
-			// its label among the options the menu built, not by guessing the wording.
+			// The hub, then Settings, then group "LithosAI", then the base URL key, then a new
+			// value. Each option is found by its label among the ones the menu built, not by
+			// guessing the wording.
 			select: [
+				(title, options) => options.find((label) => label.startsWith("Settings —")),
 				(title, options) => options.find((label) => label.startsWith("LithosAI —")),
 				(title, options) => options.find((label) => label.startsWith("lithos.baseUrl = ")),
 				"Back",
@@ -270,8 +276,9 @@ await withConfig({}, async () => {
 	const host = await makeHost({
 		model: DEEPSEEK_MODEL,
 		answers: {
-			// Clear the token preset: pick the Token group, its preset key, then "(clear)".
+			// Clear the token preset: hub, Settings, the Token group, its preset key, "(clear)".
 			select: [
+				(title, options) => options.find((label) => label.startsWith("Settings —")),
 				(title, options) => options.find((label) => label.startsWith("Token saving —")),
 				(title, options) => options.find((label) => label.startsWith("token.preset = ")),
 				"(clear)",
@@ -285,6 +292,36 @@ await withConfig({}, async () => {
 	await host.commands.get("mega").handler("menu", host.ctx);
 	const clear = host.execs.at(-1);
 	expect("menu: clearing a setting deletes it", clear?.args.slice(0, 5).join(" ") === "plugin config delete @dillydalli3r/omp-token-mega token.preset", clear);
+});
+
+// The hub is what a bare `/mega` opens, so every subcommand has to be reachable from it
+// without the user remembering a syntax — the report and the preset switch are the two an
+// action needs to reach a feature rather than the settings writer.
+await withConfig({}, async () => {
+	const host = await makeHost({
+		model: DEEPSEEK_MODEL,
+		answers: {
+			select: [
+				(title, options) => options.find((label) => label.startsWith("Report —")),
+				(title, options) => options.find((label) => label.startsWith("Token preset —")),
+				"aggressive",
+				(title, options) => options.find((label) => label.startsWith("LithosAI —")),
+				"Done",
+			],
+		},
+	});
+	await host.start();
+	await tick();
+	await host.commands.get("mega").handler("", host.ctx);
+	const report = host.rendered;
+	expect("hub: a bare /mega opens the menu and its report action renders the report", report.includes("# Token Mega") && report.includes("### DeepSeek prefix cache"), report.slice(0, 200));
+	expect("hub: a feature entry opens that feature's section", report.includes("### LithosAI"), report.slice(-260));
+	const preset = host.execs.at(-1);
+	expect(
+		"hub: the preset action writes the chosen bundle through omp's CLI",
+		preset?.args.slice(0, 5).join(" ") === "plugin config set @dillydalli3r/omp-token-mega token.preset" && preset.args[5] === "aggressive",
+		preset?.args,
+	);
 });
 
 await withConfig({}, async () => {
