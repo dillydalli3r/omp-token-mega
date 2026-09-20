@@ -25,7 +25,7 @@ const pkg = {
 	name: "@dillydalli3r/omp-token-mega",
 	version: "1.0.0",
 	description:
-		"One oh-my-pi plugin for the token economy: cache-safe reduction of live tool results, DeepSeek prefix-cache accounting with miss attribution, and the DeepSeek account balance and session spend. One command, one settings menu, one status row.",
+		"One oh-my-pi plugin for the token economy: cache-safe reduction of live tool results, DeepSeek prefix-cache accounting with miss attribution, the DeepSeek account balance and session spend, and the LithosAI provider with measured tokens/second and rate-limit metrics. One command, one settings menu, one status row.",
 	license: "MIT",
 	author: "dillydalli3r",
 	type: "module",
