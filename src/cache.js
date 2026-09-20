@@ -16,7 +16,7 @@ import { homedir } from "node:os";
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { activeModel, modelKey } from "./model.js";
-import { cacheSavings, cacheStats, isDeepSeek, priceMultiplier, pricePeriod } from "./deepseek.js";
+import { cacheSavings, cacheStats, isDeepSeek, peakLabel, priceMultiplier, pricePeriod } from "./deepseek.js";
 import { MISS_REASONS, attributeMiss, driftNote, fingerprint, toolsFingerprint } from "./prefix.js";
 import {
 	addTotals,
@@ -87,7 +87,12 @@ export function installCache(pi, shell) {
 	/** Compact token count for the row: 128 → `128`, 119,700 → `120k`. */
 	const tokens = (value) => (value >= 1000 ? `${Math.round(value / 1000)}k` : String(value));
 
-	/** One row segment: hit rate, cache reads, the money they avoided, and any drift. */
+	/**
+	 * One row segment: hit rate, cache reads, the money they avoided, and any drift.
+	 *
+	 * Parts are returned unjoined — the row renderer owns the separator — because the tariff
+	 * part carries a tone, and a part flattened into a plain string cannot be tinted afterwards.
+	 */
 	function segment() {
 		if (!active()) return undefined;
 		const { total, agents } = sessionView();
@@ -95,15 +100,20 @@ export function installCache(pi, shell) {
 		const parts = [];
 		parts.push(`DS cache ${total.hitRate === undefined ? "?" : `${Math.round(total.hitRate * 100)}%`}`);
 		if (total.cachedInputTokens > 0) parts.push(`${tokens(total.cachedInputTokens)} cached`);
-		if (total.savedUsd > 0) parts.push(`$${money(total.savedUsd)} saved`);
+		if (total.savedUsd > 0) parts.push(`$${money(total.savedUsd, 2)} saved`);
 		if (agents?.shards > 0) {
 			const agentHit = summarize(agents).hitRate;
 			parts.push(`${agents.shards} agents${agentHit === undefined ? "" : ` ${Math.round(agentHit * 100)}%`}`);
 		}
-		if (pricePeriod(activeModel(state.ctx)) === "off-peak") parts.push("off-peak");
+		// The tariff is the one figure that changes meaning rather than size, so it is the one
+		// part that carries a tone: red while the headline rate is in force, green while it is
+		// discounted. `peakLabel` is undefined when both periods bill the same, in which case
+		// the row says nothing about a period at all.
+		const peak = peakLabel(activeModel(state.ctx));
+		if (peak) parts.push({ text: peak.text, color: peak.period === "peak" ? "red" : "green" });
 		const drift = state.lastSeen?.drift;
 		if (drift) parts.push(`\u26a0 ${drift}`);
-		return parts.join(" \u00b7 ");
+		return parts;
 	}
 
 	/** Fingerprint the request prefix. Observational only — the payload is never replaced. */

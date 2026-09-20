@@ -136,7 +136,9 @@ await withConfig({}, async () => {
 	expect("provider: registered under the lithosai id", Boolean(provider), [...host.providers.keys()]);
 	expect("provider: endpoint is the documented base URL", provider?.config.baseUrl === LITHOS_BASE_URL, provider?.config.baseUrl);
 	expect("provider: OpenAI-compatible transport", provider?.config.api === "openai-completions", provider?.config.api);
-	expect("provider: key comes from the documented env var", provider?.config.apiKey === LITHOS_KEY_ENV, provider?.config.apiKey);
+	// The registered key is the variable's VALUE, or nothing at all — never the name. The
+	// dedicated block below pins both states; this run takes the environment as it finds it.
+	expect("provider: the key is never the variable name", provider?.config.apiKey !== LITHOS_KEY_ENV, provider?.config.apiKey);
 	expect("provider: /login entry is named", provider?.config.oauth?.name === "LithosAI", provider?.config.oauth?.name);
 	expect("provider: the documented model is declared", provider?.config.models?.some((model) => model.id === "moonshotai/Kimi-K3"), provider?.config.models?.map((model) => model.id));
 	expect("provider: usage reporting is wired", typeof provider?.config.usage?.parseRateLimitHeaders === "function");
@@ -193,6 +195,99 @@ await withConfig({}, async () => {
 	await host.commands.get("mega").handler("config", host.ctx);
 	expect("config: lithos keys are surfaced", host.rendered.includes("lithos.inputPerMillion"), host.rendered.slice(0, 200));
 });
+
+// ----------------------------------------------------------------- the key, and discovery
+
+{
+	// `LITHOSAI_API_KEY` is not a plugin setting, so `withEnv`/`withConfig` never pin it.
+	// Each case below sets it itself and restores it here, so a machine that happens to
+	// export the variable cannot decide the outcome of any of them.
+	const ambient = process.env[LITHOS_KEY_ENV];
+	try {
+		// Unset, no stored login: no key exists anywhere, so none is registered. That
+		// absence is what stops omp from reporting `lithosai` as signed in on a bare install.
+		delete process.env[LITHOS_KEY_ENV];
+		await withConfig({}, async () => {
+			const host = await makeHost({ model: LITHOS_MODEL });
+			await host.start();
+			await tick();
+			const provider = host.providers.get(LITHOS_PROVIDER);
+			expect("env key: unset registers no apiKey at all", !("apiKey" in provider.config), provider?.config.apiKey);
+
+			// Nothing to discover without a key, and no request goes out to discover it.
+			const realFetch = globalThis.fetch;
+			let calls = 0;
+			globalThis.fetch = async () => {
+				calls += 1;
+				throw new Error("discovery must not reach the network without a key");
+			};
+			try {
+				expect("discovery: no key resolves to an empty catalogue", (await provider.config.fetchDynamicModels(undefined)).length === 0);
+				expect("discovery: no key touches no network", calls === 0, calls);
+			} finally {
+				globalThis.fetch = realFetch;
+			}
+		});
+
+		// Set: the registered key is the variable's value, and `/models` fills the catalogue
+		// through it, at the configured rates.
+		process.env[LITHOS_KEY_ENV] = "lithos-test-key";
+		await withConfig({ "lithos.inputPerMillion": 0.6, "lithos.outputPerMillion": 2.4, "lithos.cachedPerMillion": 0.06 }, async () => {
+			const host = await makeHost({ model: LITHOS_MODEL });
+			await host.start();
+			await tick();
+			const provider = host.providers.get(LITHOS_PROVIDER);
+			expect("env key: the variable's value is registered, not its name", provider?.config.apiKey === "lithos-test-key", provider?.config.apiKey);
+
+			const realFetch = globalThis.fetch;
+			globalThis.fetch = async (url, init) => {
+				expect("discovery: reads /models on the configured base", url === `${LITHOS_BASE_URL}/models`, url);
+				expect("discovery: presents the key as a bearer token", init?.headers?.Authorization === "Bearer lithos-test-key", init?.headers);
+				return {
+					ok: true,
+					status: 200,
+					json: async () => ({
+						object: "list",
+						data: [
+							{ id: "moonshotai/Kimi-K3", object: "model", created: 1, owned_by: "Moonshot AI" },
+							{ id: "zai/GLM-5.3", object: "model", created: 1, owned_by: "Z.ai" },
+						],
+					}),
+				};
+			};
+			try {
+				const models = await provider.config.fetchDynamicModels("lithos-test-key");
+				expect(
+					"discovery: both live ids, at the configured rates and limits",
+					models.map((model) => model.id).join(",") === "moonshotai/Kimi-K3,zai/GLM-5.3" &&
+						models.every((model) => model.cost.input === 0.6 && model.cost.output === 2.4 && model.cost.cacheRead === 0.06) &&
+						models.every((model) => model.contextWindow > 0 && model.maxTokens > 0),
+					models,
+				);
+			} finally {
+				globalThis.fetch = realFetch;
+			}
+
+			// A refusal is thrown, not reported as an empty catalogue: omp keeps the cached
+			// catalogue and retries after a rejection, but an empty success is authoritative.
+			globalThis.fetch = async () => ({ ok: false, status: 401, json: async () => ({ error: "invalid key" }) });
+			try {
+				let thrown;
+				try {
+					await provider.config.fetchDynamicModels("lithos-test-key");
+				} catch (error) {
+					thrown = error;
+				}
+				expect("discovery: a 401 rejects instead of returning an empty list", thrown instanceof Error && thrown.message.includes("401"), thrown?.message);
+			} finally {
+				globalThis.fetch = realFetch;
+			}
+		});
+	} finally {
+		if (ambient === undefined) delete process.env[LITHOS_KEY_ENV];
+		else process.env[LITHOS_KEY_ENV] = ambient;
+	}
+}
 
 // ----------------------------------------------------------------- rates
 

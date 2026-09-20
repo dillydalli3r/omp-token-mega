@@ -121,5 +121,7 @@ export function balanceText(balance) {
 	const infos = balance?.infos ?? [];
 	const info = infos.find((entry) => entry.currency === "CNY") ?? infos[0];
 	if (!info) return undefined;
-	return `${info.symbol}${money(info.total)}`;
+	// Row money: hundredths, like the rest of the row's figures. The sections read the
+	// account's full precision straight off the balance object instead.
+	return `${info.symbol}${money(info.total, 2)}`;
 }

@@ -12,7 +12,7 @@ import { join } from "node:path";
 import { makeHost, withEnv, tick } from "./harness.mjs";
 import { CONFIG_SCHEMA, configDefaults, coerceValue, fallbackConfig, formatConfig, loadConfig, resetConfig, resolveAgentDir, settingsKey } from "../src/config.js";
 import { addTotals, pruneShards, readSubagentTotals } from "../src/stats.js";
-import { cacheSavings, priceMultiplier, pricePeriod } from "../src/deepseek.js";
+import { cacheSavings, peakLabel, priceMultiplier, pricePeriod } from "../src/deepseek.js";
 import { DEAD_KEYS, fix, removeDeadKeys, rollback, scan, scanText } from "../src/repair.js";
 
 const fail = [];
@@ -50,9 +50,9 @@ async function makeHarness({ root, settings, overrides, env, model } = {}) {
 		get notices() {
 			return host.notifications.map((entry) => entry.text);
 		},
-		/** Status writes in write order, `undefined` included: the row's history. */
-		get statuses() {
-			return host.statusWrites.map((write) => write.value);
+		/** The row as the plugin last drew it: one ANSI-stripped line, `undefined` when none. */
+		get row() {
+			return host.row;
 		},
 		command: () => host.commands.get("mega"),
 		fire,
@@ -104,7 +104,7 @@ const TOOLS_A = [{ function: { name: "bash" } }, { function: { name: "read" } }]
 	expect("cold start attributed to first_turn", shard.misses.byReason.first_turn === 1, shard.misses.byReason);
 	expect("tool change attributed", shard.misses.byReason.tool_change === 1, shard.misses.byReason);
 	expect("stable turns not blamed", (shard.misses.byReason.external_miss ?? 0) === 0, shard.misses.byReason);
-	expect("status row shows hit rate and savings", /DS cache \d+%/.test(h.statuses.filter(Boolean).at(-1) ?? ""));
+	expect("status row shows hit rate and savings", /DS cache \d+%/.test(h.row ?? ""));
 }
 
 // ---------------------------------------------------------------- lifecycle causes
@@ -184,6 +184,7 @@ const TOOLS_A = [{ function: { name: "bash" } }, { function: { name: "read" } }]
 // ---------------------------------------------------------------- real-time pricing
 {
 	const peak = Date.UTC(2026, 8, 16, 2, 0, 0); // Wednesday 02:00 UTC — inside a peak window
+	const early = Date.UTC(2026, 8, 16, 4, 30, 0); // Wednesday 04:30 UTC — past the first window, before the second
 	const midday = Date.UTC(2026, 8, 16, 12, 0, 0); // Wednesday 12:00 UTC — outside every window
 	const weekend = Date.UTC(2026, 8, 20, 2, 0, 0); // Sunday 02:00 UTC — same minute, no weekday match
 	expect("peak fixture is a weekday peak minute", new Date(peak).getUTCDay() === 3 && new Date(peak).getUTCHours() === 2, new Date(peak).toISOString());
@@ -192,7 +193,49 @@ const TOOLS_A = [{ function: { name: "bash" } }, { function: { name: "read" } }]
 	expect("peak keeps the headline rate", priceMultiplier(MODEL_SCHEDULED, peak) === 1 && pricePeriod(MODEL_SCHEDULED, peak) === "peak");
 	expect("off-peak applies the multiplier", priceMultiplier(MODEL_SCHEDULED, weekend) === 0.5 && priceMultiplier(MODEL_SCHEDULED, midday) === 0.5);
 	expect("off-peak period is named", pricePeriod(MODEL_SCHEDULED, weekend) === "off-peak");
-	expect("a model without a schedule has no period", pricePeriod(MODEL, peak) === undefined && priceMultiplier(MODEL, peak) === 1);
+	expect(
+		"a model without a schedule has no period and no label",
+		pricePeriod(MODEL, peak) === undefined && priceMultiplier(MODEL, peak) === 1 && peakLabel(MODEL, peak) === undefined,
+		{ period: pricePeriod(MODEL, peak), label: peakLabel(MODEL, peak) },
+	);
+
+	// The label names the window whose bounds bracket the state: the user asked when peak
+	// starts and ends, not how long is left of it.
+	const label = (at) => peakLabel(MODEL_SCHEDULED, at);
+	expect(
+		"peak label names the window in force",
+		label(peak)?.period === "peak" && label(peak)?.text === "peak 01:00\u201304:00Z",
+		label(peak),
+	);
+	expect(
+		"off-peak label names today's next window without a weekday",
+		label(early)?.text === "off-peak (peak 06:00\u201310:00Z)",
+		label(early),
+	);
+	expect("off-peak label names tomorrow's window", label(midday)?.text === "off-peak (peak Thu 01:00\u201304:00Z)", label(midday));
+	expect("off-peak label crosses the weekend to Monday", label(weekend)?.text === "off-peak (peak Mon 01:00\u201304:00Z)", label(weekend));
+
+	// A schedule that bills both periods the same is not a tariff: with no difference to
+	// report there is no period, no label, and the row must not claim a discount.
+	const flat = {
+		...MODEL_SCHEDULED,
+		cost: { ...MODEL_SCHEDULED.cost, timeBased: { offPeakMultiplier: 1, peakWindows: MODEL_SCHEDULED.cost.timeBased.peakWindows } },
+	};
+	expect(
+		"an equal tariff reports no period",
+		pricePeriod(flat, peak) === undefined && priceMultiplier(flat, peak) === 1 && peakLabel(flat, peak) === undefined,
+		{ period: pricePeriod(flat, peak), multiplier: priceMultiplier(flat, peak), label: peakLabel(flat, peak) },
+	);
+	// Discounted, but with no window to promise: the period still has to be named.
+	const windowless = {
+		...MODEL_SCHEDULED,
+		cost: { ...MODEL_SCHEDULED.cost, timeBased: { offPeakMultiplier: 0.5, peakWindows: [] } },
+	};
+	expect(
+		"a discounted schedule without windows still reports off-peak",
+		peakLabel(windowless, peak)?.text === "off-peak",
+		peakLabel(windowless, peak),
+	);
 
 	const million = (at) => cacheSavings({ cacheRead: 1_000_000 }, MODEL_SCHEDULED, at);
 	expect("savings use the peak spread", Math.abs(million(peak) - 1_000_000 * ((0.3 - 0.006) / 1_000_000)) < 1e-12, million(peak));
@@ -211,10 +254,13 @@ const TOOLS_A = [{ function: { name: "bash" } }, { function: { name: "read" } }]
 	} finally {
 		Date.now = realNow;
 	}
+	// Read while the row the off-peak turn drew is still the current one: the label names the
+	// next window (Monday's, from a Sunday) so the row and the report agree about the tariff.
+	const periodRow = h.row ?? "";
 	await h.fire("session_shutdown", {});
 	const [shard] = await Promise.all((await h.shardFiles()).map((name) => readJson(join(h.shardsDir, name))));
 	expect("recorded savings use the off-peak card", Math.abs(shard.totals.savedUsd - million(weekend)) < 1e-12, shard.totals.savedUsd);
-	expect("the status row names the period", (h.statuses.filter(Boolean).at(-1) ?? "").includes("off-peak"), h.statuses.at(-1));
+	expect("the status row names the period and its window", periodRow.includes("off-peak (peak Mon 01:00\u201304:00Z)"), periodRow);
 }
 
 // ---------------------------------------------------------------- session-wide metrics
@@ -243,12 +289,12 @@ const TOOLS_A = [{ function: { name: "bash" } }, { function: { name: "read" } }]
 
 	await h.request([1, 2, 3, 4], TOOLS_A);
 	await h.response({ input: 0, output: 100, cacheRead: 9_900, cacheWrite: 0, cost: { total: 0.0001 } });
-	const row = h.statuses.filter(Boolean).at(-1) ?? "";
+	const row = h.row ?? "";
 	expect("status row includes subagent traffic", row.includes("1 agents 100%"), row);
 	// The merged row keeps one money figure per feature: the cache segment reports what the
 	// cache saved, the balance segment reports what the session spent. Asserting `cost` here
 	// would be the same number twice.
-	expect("status row reports the session-wide saving", /\$0\.00\d+ saved/.test(row), row);
+	expect("status row reports the session-wide saving rounded to hundredths", row.includes("$0.01 saved"), row);
 	expect("status row cached tokens cover the whole session", row.includes("120k cached"), row);
 	// Main alone is 19,700 / 29,700 = 66%; the child lifts the session figure to 92%.
 	expect("status row hit rate is the session figure", /DS cache 92%/.test(row), row);
@@ -471,7 +517,7 @@ expect("child session resolves the same agent dir", resolveAgentDir(childCtx) ==
 	await h.response({ input: 10_000, output: 10, cacheRead: 0, cacheWrite: 0, cost: { total: 0.001 } });
 	await h.fire("session_shutdown", {});
 	expect("disabled plugin writes no shard", (await h.shardFiles()).length === 0);
-	expect("disabled plugin draws no status row", h.statuses.at(-1) === undefined, h.statuses);
+	expect("disabled plugin draws no status row", h.row === undefined, h.row);
 
 	const quiet = await makeHarness({ settings: { "@dillydalli3r/omp-token-mega": { statusRow: false } } });
 	await quiet.fire("before_agent_start", { systemPrompt: ["you are omp"] });
@@ -479,13 +525,13 @@ expect("child session resolves the same agent dir", resolveAgentDir(childCtx) ==
 	await quiet.response({ input: 10_000, output: 10, cacheRead: 0, cacheWrite: 0, cost: { total: 0.001 } });
 	await quiet.fire("session_shutdown", {});
 	expect("statusRow off still accounts", (await quiet.shardFiles()).length === 1);
-	expect("statusRow off clears the row", quiet.statuses.at(-1) === undefined, quiet.statuses);
+	expect("statusRow off clears the row", quiet.row === undefined, quiet.row);
 
 	const narrow = await makeHarness({ settings: { "@dillydalli3r/omp-token-mega": { statusMaxChars: 40 } } });
 	await narrow.fire("before_agent_start", { systemPrompt: ["you are omp"] });
 	await narrow.request([1, 2], TOOLS_A);
 	await narrow.response({ input: 10_000, output: 10, cacheRead: 9_800, cacheWrite: 0, cost: { total: 0.001 } });
-	const row = narrow.statuses.filter(Boolean).at(-1) ?? "";
+	const row = narrow.row ?? "";
 	expect("statusMaxChars is honoured", row.length <= 40 && row.length > 0, { row, length: row.length });
 
 	const noAgents = await makeHarness({ settings: { "@dillydalli3r/omp-token-mega": { "cache.subagents": false } } });
@@ -503,9 +549,17 @@ expect("child session resolves the same agent dir", resolveAgentDir(childCtx) ==
 	await small.response({ input: 10_000, output: 10, cacheRead: 0, cacheWrite: 0, cost: { total: 0.003 } });
 	await small.request([1, 2, 3], TOOLS_A);
 	await small.response({ input: 128, output: 10, cacheRead: 128, cacheWrite: 0, cost: { total: 0.000039 } });
-	const smallRow = small.statuses.filter(Boolean).at(-1) ?? "";
-	// 128 cached tokens and $0.000038 saved must both be legible, not rounded to `0k` / `$0.0000`.
-	expect("small counts keep their magnitude", smallRow.includes("128 cached") && /\$0\.0000\d\d saved/.test(smallRow), smallRow);
+	const smallRow = small.row ?? "";
+	// 128 cached tokens stay legible in the row, not rounded to `0k`. The money the row
+	// carries is currency — hundredths — so a sub-cent saving reads `$0.00` there, and the
+	// magnitude lives in the section, which is the ledger.
+	expect("small counts keep their magnitude", smallRow.includes("128 cached") && smallRow.includes("$0.00 saved"), smallRow);
+	await small.command().handler("cache", small.ctx);
+	expect(
+		"the section keeps the sub-cent saving",
+		/\$0\.0000\d\d/.test(small.messages.at(-1)?.content ?? ""),
+		(small.messages.at(-1)?.content ?? "").slice(-400),
+	);
 
 	const custom = join(await mkdtemp(join(tmpdir(), "megacache-statedir-")), "elsewhere");
 	const redirected = await makeHarness({ env: { OMP_TOKEN_MEGA_DIR: custom } });

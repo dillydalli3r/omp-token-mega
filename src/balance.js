@@ -63,8 +63,8 @@ export function installBalance(pi, shell) {
 		const agents = spend.agents.cost;
 		parts.push(
 			agents > 0
-				? `used $${money(spend.total.cost)} (main $${money(spend.parent.cost)} + agents $${money(agents)})`
-				: `used $${money(spend.total.cost)}`,
+				? `used $${money(spend.total.cost, 2)} (main $${money(spend.parent.cost, 2)} + agents $${money(agents, 2)})`
+				: `used $${money(spend.total.cost, 2)}`,
 		);
 		return parts.join(" \u00b7 ");
 	}

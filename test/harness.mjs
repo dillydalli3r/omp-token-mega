@@ -3,9 +3,11 @@
  *
  * Every suite runs the *merged* plugin, so the host has to model what the merge relies on:
  * several handlers per event (the shell reloads configuration and three features each
- * subscribe to their own slice of the lifecycle), one command, one tool, and a status
- * surface that records every write — including the key it was written under, because
- * "one row" is a property of the plugin (one status key), not of the renderer.
+ * subscribe to their own slice of the lifecycle), one command, one tool, and the one row —
+ * drawn as a widget the plugin owns (`setWidget(key, factory, { placement: "belowEditor" })`)
+ * rather than as status text, because omp strips ANSI from `setStatus` and would take the
+ * row's tint with it. The host records every widget write, including the key it was written
+ * under, because "one row" is a property of the plugin (one key), not of the renderer.
  *
  * End-to-end suites pin *every* plugin setting through its environment variable, which is
  * the highest-precedence layer, so a run cannot be perturbed by a global plugin config or
@@ -24,6 +26,28 @@ import { CONFIG_SCHEMA, settingsKey } from "../src/config.js";
 import tokenMega from "../src/index.js";
 
 export const STATUS_KEY = "omp-token-mega";
+
+/** Strip ANSI/VT escape sequences, so a suite can compare the row as the user reads it. */
+export function stripAnsi(text) {
+	return String(text).replace(/\u001b\[[0-9;?]*[A-Za-z]/g, "");
+}
+
+/** The row component ignores its `tui` argument; any object stands in for one. */
+const FAKE_TUI = {};
+
+/**
+ * The theme the row component is drawn with: the roles the row's tones map to, each opened
+ * and closed the way a real theme does, everything else untouched. A suite reads the result
+ * through `host.tint` to see the color the terminal would get.
+ */
+export const TINT_CODES = { error: "\u001b[31m", success: "\u001b[32m", warning: "\u001b[33m" };
+
+export const FAKE_THEME = {
+	fg(role, text) {
+		const open = TINT_CODES[role];
+		return open === undefined ? String(text) : `${open}${text}\u001b[39m`;
+	},
+};
 
 /** A DeepSeek model with the declared tariff the cache accounting prices against. */
 export const DEEPSEEK_MODEL = {
@@ -147,6 +171,8 @@ export async function makeHost({
 	const execs = [];
 	const statuses = new Map();
 	const statusWrites = [];
+	const widgets = new Map();
+	const widgetWrites = [];
 	const notifications = [];
 	const messages = [];
 	const timers = new Map();
@@ -161,6 +187,13 @@ export async function makeHost({
 			setStatus(key, value) {
 				statuses.set(key, value);
 				statusWrites.push({ key, value });
+			},
+			setWidget(key, content, options) {
+				// `undefined` is how the plugin withdraws its row (feature off, no metrics): the
+				// TUI drops the widget, so the host does too rather than rendering a stale line.
+				if (content === undefined) widgets.delete(key);
+				else widgets.set(key, content);
+				widgetWrites.push({ key, content, options });
 			},
 			async select(title, options) {
 				return scripted("select", title, options);
@@ -253,6 +286,20 @@ export async function makeHost({
 		return results.filter((result) => result !== undefined);
 	};
 
+	/**
+	 * The plugin's row as its own component draws it, or `undefined` when no widget is
+	 * registered (`setWidget(key, undefined)` is how the plugin withdraws it).
+	 *
+	 * Only line 0 is returned: the row is one line by contract, so a second line is a plugin
+	 * bug a suite should see as a mismatch rather than as a silently joined string.
+	 */
+	function rowLine() {
+		const content = widgets.get(STATUS_KEY);
+		if (typeof content === "function") return content(FAKE_TUI, FAKE_THEME).render(200)?.[0];
+		if (Array.isArray(content)) return content[0];
+		return typeof content === "string" ? content : undefined;
+	}
+
 	const host = {
 		pi,
 		ctx,
@@ -293,10 +340,22 @@ export async function makeHost({
 			}
 			await tick();
 		},
+		/** The row as the terminal shows it: one ANSI-stripped line. */
 		get row() {
-			return statuses.get(STATUS_KEY);
+			const line = rowLine();
+			return line === undefined ? undefined : stripAnsi(line);
 		},
-		/** Every status key written, deduplicated — one key is the "one row" contract. */
+		/** The same line with the theme's ANSI left in, so a suite can assert a tone. */
+		get tint() {
+			return rowLine();
+		},
+		/** Every widget write, in order, with the key and options it was made under. */
+		rowWrites: widgetWrites,
+		/** Every widget key written, deduplicated — one key is the "one row" contract. */
+		get rowKeys() {
+			return [...new Set(widgetWrites.map((write) => write.key))];
+		},
+		/** Every status key written, deduplicated — the surface the row no longer uses. */
 		get statusKeys() {
 			return [...new Set(statusWrites.map((write) => write.key))];
 		},

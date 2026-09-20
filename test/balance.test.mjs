@@ -35,7 +35,7 @@ await withConfig({}, async () => {
 	await tick();
 
 	expect("deepseek: row rendered", typeof host.row === "string" && host.row.includes("DS "), host.row);
-	expect("deepseek: row shows the fetched balance at full precision", host.row?.includes("$11.4800"), host.row);
+	expect("deepseek: the row rounds the balance to hundredths", host.row?.includes("$11.48") && !host.row.includes("$11.4800"), host.row);
 	expect("deepseek: balance endpoint called once", fetches === 1, fetches);
 	expect("deepseek: poll timer armed", host.timers.size === 1, [...host.timers.values()].map((timer) => timer.ms));
 
@@ -78,5 +78,8 @@ await withConfig({}, async () => {
 expect("money: trailing zeros kept", money(11.48) === "11.4800" && money(0.1) === "0.1000");
 expect("money: sub-cent keeps six places", money(0.0041) === "0.004100");
 expect("money: zero never renders a sign", money(0) === "0.0000" && money(-0.0000001) === "0.000000");
+// The row's precision, pinned by the caller: currency, not a ledger figure.
+expect("money: hundredths round both ways", money(11.48, 2) === "11.48" && money(0.005892, 2) === "0.01", money(0.005892, 2));
+expect("money: hundredths still drop a rounded-away sign", money(0.0041, 2) === "0.00" && money(-0.004, 2) === "0.00", money(-0.004, 2));
 
 done();

@@ -61,12 +61,17 @@ export function formatSaving(bytes) {
  * included, so a figure's width never depends on whether trailing digits happen to be
  * used. Six places below a cent keep sub-cent amounts visible; zero itself uses the
  * four-place form. Never renders "-0".
+ *
+ * `digits` pins the precision. The row asks for hundredths — the precision a currency
+ * is read at — while the ledgers (the sections, the balance table, the model-facing
+ * figures) keep the default, because rounding a ledger to the cent throws away the
+ * only numbers it exists to carry.
  */
-export function money(value) {
+export function money(value, digits) {
 	const n = Number(value);
-	if (!Number.isFinite(n)) return "0.0000";
-	const digits = n !== 0 && Math.abs(n) < 0.01 ? 6 : 4;
-	const text = Math.abs(n).toFixed(digits);
+	if (!Number.isFinite(n)) return (0).toFixed(digits ?? 4);
+	const places = Number.isInteger(digits) && digits >= 0 ? digits : n !== 0 && Math.abs(n) < 0.01 ? 6 : 4;
+	const text = Math.abs(n).toFixed(places);
 	if (Number(text) === 0) return text;
 	return n < 0 ? `-${text}` : text;
 }

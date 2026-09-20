@@ -9,11 +9,12 @@
  *   lithos   register LithosAI (models, /login), measure its speed and budgets
  *   balance  DeepSeek account balance and this session's USD spend
  *
- * The status row is the reason they were merged. omp renders one footer line per status
- * key (`status-line/component.ts`: `this.#sortedHookStatuses.map(text => lines.push(...))`),
- * so three plugins meant three rows of chrome for the rest of the session. This plugin
- * registers exactly one key and composes every metric into that line; segments that do not
- * fit the configured width are dropped whole.
+ * The status row is the reason they were merged: one line, one key, every metric a part of
+ * it — three plugins used to mean three rows of chrome for the rest of the session. The row
+ * is published as a widget the plugin draws itself (`ctx.ui.setWidget`, `placement:
+ * "belowEditor"`) instead of as a status entry, because omp strips ANSI from hook status
+ * text and would flatten the peak/off-peak tint (see ./status.js); segments that do not fit
+ * the configured width are dropped whole.
  *
  *   /mega                  report: token saving, cache, balance — one document
  *   /mega status           the status row, as text
@@ -45,7 +46,7 @@ import {
 	resolveAgentDir,
 	statusSegmentNames,
 } from "./config.js";
-import { composeStatus } from "./status.js";
+import { composeRow, renderRow, themeTint } from "./status.js";
 import { megaReport } from "./report.js";
 import { configMenu, menuFallback, writeSetting } from "./menu.js";
 import { installToken } from "./token.js";
@@ -102,21 +103,21 @@ export default function tokenMega(pi) {
 	}
 
 	/** The one row: every feature's segment, in the configured order. */
-	function statusText() {
+	function row() {
 		const segments = {
 			cache: features.cache?.segment(),
 			lithos: features.lithos?.segment(),
 			balance: features.balance?.segment(),
 			token: features.token?.segment(),
 		};
-		return composeStatus({
+		return composeRow({
 			names: statusSegmentNames(values()),
 			segments,
 			maxChars: values().statusMaxChars,
 		});
 	}
 
-	/** Last text handed to the host, so an unchanged row is not repainted. */
+	/** Last text handed to the host, so an unchanged row is not republished. */
 	let lastRow;
 
 	function render() {
@@ -124,12 +125,31 @@ export default function tokenMega(pi) {
 		if (!ctx?.hasUI) return;
 		try {
 			const show = enabled() && values().statusRow === true;
-			const text = show ? statusText() : undefined;
+			const rows = show ? row() : undefined;
+			// Deduplicated on the plain text: tint and clipping are derived from these same
+			// rows, so a row that reads the same is never republished to the host.
+			const text = renderRow(rows);
 			if (text === lastRow) return;
 			lastRow = text;
-			ctx.ui.setStatus(STATUS_KEY, text);
+			// The row is bounded by the narrower of the terminal and `statusMaxChars`: the
+			// budget chooses which segments fit, and a first segment wider than the budget
+			// still has to be clipped when the component draws it.
+			const cap = Number.isFinite(values().statusMaxChars) && values().statusMaxChars > 0 ? values().statusMaxChars : Number.POSITIVE_INFINITY;
+			ctx.ui.setWidget(
+				STATUS_KEY,
+				rows === undefined
+					? undefined
+					: (_tui, theme) => ({
+							render: (width) => {
+								const line = renderRow(rows, { width: Math.min(width, cap), tint: themeTint(theme) });
+								return line === undefined ? [] : [line];
+							},
+							invalidate() {},
+						}),
+				{ placement: "belowEditor" },
+			);
 		} catch {
-			// No status surface in this mode.
+			// A host with no widget surface (RPC, ACP, headless) must not fail the turn.
 		}
 	}
 
@@ -263,7 +283,8 @@ export default function tokenMega(pi) {
 			const rest = parts.slice(1).join(" ");
 
 			if (sub === "status") {
-				const line = enabled() && values().statusRow === true ? statusText() : undefined;
+				const rows = enabled() && values().statusRow === true ? row() : undefined;
+				const line = renderRow(rows, { width: values().statusMaxChars });
 				ctx.ui.notify(line ?? (enabled() ? "No metrics yet." : "Token Mega is disabled (`enabled`)."), "info");
 				return;
 			}

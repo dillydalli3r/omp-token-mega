@@ -2,16 +2,17 @@
  * The merge's own contract.
  *
  * Three plugins became one, and the parts that must be *one* are the parts a user sees:
- * one status row (omp renders one footer line per status key, so a second key is a second
- * row), one command, and one settings menu covering every feature's keys. This suite
- * pins those, plus the composition rules the row relies on.
+ * one status row (a second key is a second footer line), one command, and one settings
+ * menu covering every feature's keys. This suite pins those, plus the composition rules
+ * the row relies on: the row is a widget the plugin renders itself, which is what lets the
+ * tariff note carry the host theme's colours even though omp strips ANSI from status text.
  *
  *   node test/shell.test.mjs
  */
 
-import { checks, DEEPSEEK_MODEL, makeHost, STATUS_KEY, tick, withConfig } from "./harness.mjs";
+import { checks, DEEPSEEK_MODEL, makeHost, SCHEDULED_MODEL, STATUS_KEY, tick, withConfig } from "./harness.mjs";
 import { CONFIG_KEYS, CONFIG_SCHEMA, KEY_GROUPS, STATUS_SEGMENTS, statusSegmentNames } from "../src/config.js";
-import { composeStatus } from "../src/status.js";
+import { composeRow, renderRow, TINTS } from "../src/status.js";
 
 const { expect, done } = checks();
 
@@ -20,26 +21,62 @@ const { expect, done } = checks();
 {
 	const names = ["cache", "balance", "token"];
 	const segments = { cache: "DS cache 87%", balance: "DS \u00a511.48", token: "TS -1.0 KB" };
-	const all = composeStatus({ names, segments, maxChars: 120 });
+
+	// `composeRow` decides what belongs on the line — order, separators, budget — and
+	// `renderRow` turns its parts into the one string the widget hands the host.
+	const all = renderRow(composeRow({ names, segments, maxChars: 120 }));
 	expect("composition: every segment on one line", all === "DS cache 87% \u00b7 DS \u00a511.48 \u00b7 TS -1.0 KB", all);
 	expect("composition: separators are the family's middle dot", (all.match(/\u00b7/g) ?? []).length === 2, all);
 
-	const ordered = composeStatus({ names: ["token", "cache"], segments, maxChars: 120 });
+	const ordered = renderRow(composeRow({ names: ["token", "cache"], segments, maxChars: 120 }));
 	expect("composition: order follows the configured list", ordered === "TS -1.0 KB \u00b7 DS cache 87%", ordered);
 
-	const unknown = composeStatus({ names: ["cache", "nope", "token"], segments, maxChars: 120 });
+	const unknown = renderRow(composeRow({ names: ["cache", "nope", "token"], segments, maxChars: 120 }));
 	expect("composition: unknown segment names are ignored", unknown === "DS cache 87% \u00b7 TS -1.0 KB", unknown);
 
-	const absent = segments.cache === undefined;
-	expect("composition: an absent feature contributes nothing", !absent, absent);
-	const partial = composeStatus({ names, segments: { cache: "DS cache 87%", balance: undefined, token: "TS -1.0 KB" }, maxChars: 120 });
+	// A feature with nothing to say is absent from the map, not mapped to a placeholder.
+	const absent = renderRow(composeRow({ names: ["cache", "lithos"], segments, maxChars: 120 }));
+	expect("composition: an absent feature contributes nothing", absent === "DS cache 87%", absent);
+	const partial = renderRow(composeRow({ names, segments: { cache: "DS cache 87%", balance: undefined, token: "TS -1.0 KB" }, maxChars: 120 }));
 	expect("composition: a gated-off feature is skipped, not blanked", partial === "DS cache 87% \u00b7 TS -1.0 KB", partial);
 
-	const dropped = composeStatus({ names, segments, maxChars: 20 });
+	const dropped = renderRow(composeRow({ names, segments, maxChars: 20 }));
 	expect("composition: a segment that does not fit is dropped whole", dropped === "DS cache 87%", dropped);
-	const sliced = composeStatus({ names, segments: { cache: "x".repeat(80) }, maxChars: 40 });
+
+	// The first segment has no earlier one to give up for it, so it survives composition and
+	// the renderer clips it to the terminal instead: a narrow row still shows something.
+	const long = composeRow({ names, segments: { cache: "x".repeat(80) }, maxChars: 40 });
+	expect("composition: an over-long first segment is kept whole", long?.[0]?.[0]?.text?.length === 80, long?.[0]?.[0]?.text?.length);
+	const sliced = renderRow(long, { width: 40 });
 	expect("composition: a first segment longer than the row is hard-sliced", sliced.length === 40, sliced.length);
-	expect("composition: nothing to show yields nothing", composeStatus({ names, segments: {}, maxChars: 120 }) === undefined);
+
+	expect("composition: nothing to show yields nothing", composeRow({ names, segments: {}, maxChars: 120 }) === undefined);
+}
+
+// ----------------------------------------------------------------- the row's tones
+
+{
+	// The host hands the widget a theme; a tone name resolves through TINTS to the role that
+	// paints it. The palette below is the harness theme, spelled out so the escapes the row
+	// is expected to carry are readable here.
+	const ANSI = { error: "\u001b[31m", success: "\u001b[32m", warning: "\u001b[33m" };
+	const theme = { fg: (role, text) => (ANSI[role] ? `${ANSI[role]}${text}\u001b[39m` : text) };
+	const tint = (tone, text) => theme.fg(TINTS[tone] ?? "text", text);
+
+	const rows = composeRow({
+		names: ["cache"],
+		segments: { cache: [{ text: "DS cache 87%" }, { text: "off-peak", color: "green" }] },
+		maxChars: 120,
+	});
+	// Parts of one segment are separated exactly like segments are, so a tinted note reads
+	// as part of the cache group rather than as a row of its own.
+	const plain = renderRow(rows);
+	expect("tones: parts of one segment are separated too", plain === "DS cache 87% \u00b7 off-peak", plain);
+	expect("tones: without a tint the row is plain text", !plain.includes("\u001b"), plain);
+	const painted = renderRow(rows, { tint });
+	expect("tones: a green part is drawn in the theme's success colour", painted === "DS cache 87% \u00b7 \u001b[32moff-peak\u001b[39m", painted);
+	const mauve = renderRow(composeRow({ names: ["cache"], segments: { cache: [{ text: "DS cache 87%", color: "mauve" }] }, maxChars: 120 }), { tint });
+	expect("tones: a part whose tone the theme does not know stays plain", mauve === "DS cache 87%", mauve);
 }
 
 // ----------------------------------------------------------------- the one row
@@ -50,26 +87,29 @@ await withConfig({}, async () => {
 	await tick();
 
 	// A DeepSeek session with a completed response and a rewritten tool result: all four
-	// features have something to say, and all of it lands on one keyed row.
+	// features have something to say, and all of it lands on one keyed widget — the plugin's
+	// own renderer, which is what lets the row carry theme colours.
 	await host.fire("before_agent_start", { systemPrompt: ["you are omp"] });
 	await host.request([1, 2], [{ function: { name: "bash" } }]);
 	await host.response({ input: 10_000, output: 100, cacheRead: 9_800, cacheWrite: 0, cost: { total: 0.003 } });
 	await host.toolResult(`${"noise   \n".repeat(500)}`);
 
-	expect("row: exactly one status key is ever written", host.statusKeys.length === 1 && host.statusKeys[0] === STATUS_KEY, host.statusKeys);
+	expect("row: the plugin publishes exactly one widget key, ever", host.rowKeys.length === 1 && host.rowKeys[0] === STATUS_KEY, host.rowKeys);
 	expect("row: the key is the plugin's own", STATUS_KEY === "omp-token-mega", STATUS_KEY);
 	expect("row: cache segment present", host.row?.includes("DS cache"), host.row);
 	expect("row: balance segment present", host.row?.includes("used $"), host.row);
 	expect("row: token segment present", host.row?.includes("TS "), host.row);
 	expect("row: one line, never a newline", !host.row?.includes("\n"), host.row);
 
-	const writes = host.statusWrites.length;
+	const writes = host.rowWrites.length;
 	// Nothing changed between two renders: the host must not be repainted for no reason.
 	await host.fire("turn_end", {});
-	expect("row: an unchanged row is not rewritten", host.statusWrites.length === writes, host.statusWrites.length - writes);
+	expect("row: an unchanged row is not rewritten", host.rowWrites.length === writes, host.rowWrites.length - writes);
 
-	// Turning a segment off removes it from the row without touching the others.
-	host.ctx.ui.setStatus(STATUS_KEY, undefined);
+	// The plugin's clear path is the same write with no content: releasing the widget is
+	// what hides the row, rather than painting it empty.
+	host.ctx.ui.setWidget(STATUS_KEY, undefined);
+	expect("row: clearing the widget clears the row", host.row === undefined, host.row);
 });
 
 await withConfig({ statusSegments: "token" }, async () => {
@@ -89,6 +129,52 @@ await withConfig({ statusSegments: "nope" }, async () => {
 	await tick();
 	expect("segments: a list with nothing usable hides the row", host.row === undefined, host.row);
 });
+
+// ----------------------------------------------------------------- the row's tint
+
+{
+	// The tariff note is the one part of the row whose meaning *is* its colour, and omp
+	// strips ANSI from status text — so it can only be drawn by the plugin's own widget,
+	// in the theme the host passes the factory. 2026-09-16 is a Wednesday: 02:00 UTC sits
+	// inside the 01:00–04:00Z peak window and 12:00 UTC inside none, and pinning the clock
+	// keeps the assertions from depending on when the suite runs.
+	const peakAt = Date.UTC(2026, 8, 16, 2, 0, 0);
+	const offPeakAt = Date.UTC(2026, 8, 16, 12, 0, 0);
+	const realNow = Date.now;
+	/** omp renders status text with ANSI stripped; colour is the only difference. */
+	const strip = (text) => text.replace(/\u001b\[\d+m/g, "");
+
+	/** The row a session on `model` publishes, read while the clock says `clock`. */
+	const rowAt = async (model, clock) => {
+		Date.now = () => clock;
+		try {
+			return await withConfig({}, async () => {
+				const host = await makeHost({ model });
+				await host.start();
+				await tick();
+				await host.request([1, 2], [{ function: { name: "bash" } }]);
+				await host.response({ input: 10_000, output: 100, cacheRead: 9_800, cacheWrite: 0, cost: { total: 0.003 } });
+				return { row: host.row, tint: host.tint };
+			});
+		} finally {
+			Date.now = realNow;
+		}
+	};
+
+	const peak = await rowAt(SCHEDULED_MODEL, peakAt);
+	expect("tint: a peak row names the window it is in", peak.row?.includes("peak 01:00\u201304:00Z"), peak.row);
+	expect("tint: a peak-priced row is drawn red", peak.tint?.includes("\u001b[31mpeak "), peak.tint);
+	expect("tint: the host's plain row is the tinted row without its escapes", Boolean(peak.row) && strip(peak.tint ?? "") === peak.row, peak.row);
+
+	const offPeak = await rowAt(SCHEDULED_MODEL, offPeakAt);
+	expect("tint: an off-peak row names the peak window it waits for", offPeak.row?.includes("off-peak (peak "), offPeak.row);
+	expect("tint: an off-peak row is drawn green", offPeak.tint?.includes("\u001b[32moff-peak"), offPeak.tint);
+
+	// A model with no declared schedule has one price all day: both periods cost the same,
+	// so there is nothing to name and nothing to tint — the row stays plain.
+	const flat = await rowAt(DEEPSEEK_MODEL, offPeakAt);
+	expect("tint: a row with no tariff note carries no colour at all", Boolean(flat.row) && !(flat.tint ?? "").includes("\u001b"), flat.tint);
+}
 
 // ----------------------------------------------------------------- segment list rules
 

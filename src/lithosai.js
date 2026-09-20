@@ -24,6 +24,13 @@
  * nothing is polled, and no segment is drawn. The provider registration itself is the
  * exception — it exists so a LithosAI model is *available* to load in the first place.
  *
+ * Auth is one key, and it comes from a `/login lithosai` credential or from the *value* of
+ * `LITHOSAI_API_KEY` — never from the variable name. omp resolves a registered provider
+ * `apiKey` as "the environment variable's value, else the literal string", so registering
+ * the name would hand every install the literal `LITHOSAI_API_KEY` as a credential: omp
+ * would report `lithosai` as signed in (config override), that override would outrank
+ * whatever `/login` stored, and `/models` would answer 401.
+ *
  * Docs: https://docs.lithosai.com (base URL, rate limits, billing, per-harness guides).
  */
 
@@ -120,7 +127,12 @@ export function parseRateLimitHeaders(headers, now = Date.now()) {
 	return { provider: LITHOS_PROVIDER, fetchedAt: now, limits };
 }
 
-/** The model list this provider declares: one documented model, at the configured rates. */
+/**
+ * The model list this provider declares at registration: the offline fallback, one
+ * documented model at the configured rates. It is what makes a LithosAI model loadable
+ * before any key exists — the live catalogue, ids discovered from `/models` at these same
+ * rates, arrives through `fetchDynamicModels` once the provider is authenticated.
+ */
 export function lithosModels(rates) {
 	return [
 		{
@@ -200,6 +212,23 @@ export async function loginLithos(callbacks, { baseUrl = LITHOS_BASE_URL } = {})
 	return key;
 }
 
+/**
+ * The API key `LITHOSAI_API_KEY` holds, or `undefined` when the variable is unset or
+ * blank.
+ *
+ * omp reads a registered provider `apiKey` as "the environment variable's value, else the
+ * literal string", so the registration must carry a resolved value or nothing: registering
+ * the variable NAME would make `lithosai` look authenticated — with the literal
+ * `LITHOSAI_API_KEY` as the credential — on every install that has neither the variable
+ * nor a `/login`, and that config override would outrank the stored login too. Reading the
+ * value here keeps "no key anywhere" a state omp can see, and lets a `/login` credential
+ * be the only key in play.
+ */
+function lithosEnvKey() {
+	const value = process.env[LITHOS_KEY_ENV];
+	return typeof value === "string" && value.trim() !== "" ? value.trim() : undefined;
+}
+
 export function installLithos(pi, shell) {
 	const state = {
 		ctx: undefined,
@@ -231,15 +260,26 @@ export function installLithos(pi, shell) {
 	function registration() {
 		const currentRates = rates();
 		const url = baseUrl();
+		const key = lithosEnvKey();
 		return {
 			baseUrl: url,
 			api: "openai-completions",
-			apiKey: LITHOS_KEY_ENV,
+			// Only a value that exists is registered; see `lithosEnvKey`. An absent `apiKey`
+			// leaves a `/login` credential — or nothing — as the provider's only key.
+			...(key === undefined ? {} : { apiKey: key }),
 			models: lithosModels(currentRates),
 			fetchDynamicModels: async (apiKey) => {
+				// No resolved key is "nothing to discover", not "ask anyway": a request without
+				// one can only 401, and it would do it on every startup of an unauthenticated
+				// install.
 				if (!apiKey) return [];
+				// A refusal throws rather than returning an empty list, and the difference is
+				// deliberate: omp reads a rejected discovery fetch as "keep the cached catalogue
+				// and try again", while a successful-but-empty `/models` is authoritative for
+				// this cycle and clears it.
 				const checked = await validateKey(apiKey, { baseUrl: url });
-				return checked.ok ? discoveredModels(checked.models, currentRates) : [];
+				if (!checked.ok) throw new Error(`LithosAI /models failed: ${checked.error}`);
+				return discoveredModels(checked.models, currentRates);
 			},
 			oauth: {
 				name: "LithosAI",
@@ -276,22 +316,25 @@ export function installLithos(pi, shell) {
 		return headers;
 	}
 
+	/** What a registration is decided by: endpoint, rates, and the resolved key. */
+	const fingerprint = () => JSON.stringify({ baseUrl: baseUrl(), ...rates(), apiKey: lithosEnvKey() });
+
 	/** Register at load with schema defaults so the provider exists for `/login` and `/model`. */
 	pi.registerProvider(LITHOS_PROVIDER, registration());
-	state.registered = JSON.stringify({ baseUrl: baseUrl(), ...rates() });
+	state.registered = fingerprint();
 
 	/** Re-register when the resolved configuration differs from what is registered. */
 	function syncRegistration() {
 		if (!registering()) return;
-		const fingerprint = JSON.stringify({ baseUrl: baseUrl(), ...rates() });
-		if (fingerprint === state.registered) return;
+		const next = fingerprint();
+		if (next === state.registered) return;
 		try {
 			pi.unregisterProvider(LITHOS_PROVIDER);
 		} catch {
 			// Nothing registered under this name; the registration below is the whole point.
 		}
 		pi.registerProvider(LITHOS_PROVIDER, registration());
-		state.registered = fingerprint;
+		state.registered = next;
 	}
 
 	pi.on("session_start", async (_event, ctx) => {
