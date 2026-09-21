@@ -11,7 +11,19 @@
  */
 
 import { checks, makeHost, tick, withConfig } from "./harness.mjs";
-import { LITHOS_BASE_URL, LITHOS_KEY_ENV, LITHOS_PROVIDER, loginLithos, parseBudgets, parseRateLimitHeaders, validateKey } from "../src/lithosai.js";
+import {
+	LITHOS_BASE_URL,
+	LITHOS_CATALOGUE,
+	LITHOS_FALLBACK_CONTEXT_WINDOW,
+	LITHOS_FALLBACK_MAX_TOKENS,
+	LITHOS_KEY_ENV,
+	LITHOS_PROVIDER,
+	lithosRates,
+	loginLithos,
+	parseBudgets,
+	parseRateLimitHeaders,
+	validateKey,
+} from "../src/lithosai.js";
 
 const { expect, done } = checks();
 
@@ -25,6 +37,11 @@ const HEADERS = {
 };
 
 const LITHOS_MODEL = { provider: LITHOS_PROVIDER, id: "moonshotai/Kimi-K3", baseUrl: LITHOS_BASE_URL };
+
+/** One assistant turn as the session branch records it — the source both cost figures read. */
+const BRANCH = [
+	{ type: "message", message: { role: "assistant", usage: { input: 4_000, output: 500, cacheRead: 0, cacheWrite: 0, cost: { total: 0.0172 } } } },
+];
 
 // ----------------------------------------------------------------- header parsing
 
@@ -129,6 +146,7 @@ const LITHOS_MODEL = { provider: LITHOS_PROVIDER, id: "moonshotai/Kimi-K3", base
 
 await withConfig({}, async () => {
 	const host = await makeHost({ model: LITHOS_MODEL });
+	host.ctx.sessionManager.getBranch = () => BRANCH;
 	await host.start();
 	await tick();
 
@@ -142,17 +160,33 @@ await withConfig({}, async () => {
 	expect("provider: /login entry is named", provider?.config.oauth?.name === "LithosAI", provider?.config.oauth?.name);
 	expect("provider: the documented model is declared", provider?.config.models?.some((model) => model.id === "moonshotai/Kimi-K3"), provider?.config.models?.map((model) => model.id));
 	expect("provider: usage reporting is wired", typeof provider?.config.usage?.parseRateLimitHeaders === "function");
-	expect("provider: cost is zero until rates are set", provider?.config.models?.every((model) => model.cost.input === 0), provider?.config.models?.[0]?.cost);
+
+	// Rates and limits are published, plus the price list is what a session bills at.
+	const flash = provider?.config.models?.find((model) => model.id === "deepseek-ai/DeepSeek-V4.1-Flash");
+	expect(
+		"provider: the published rates are registered, not zeros",
+		flash?.cost.input === 0.15 && flash.cost.cacheRead === 0.003 && flash.cost.output === 0.6,
+		flash?.cost,
+	);
+	expect(
+		"provider: the published 1M window replaces the old 256K one",
+		flash?.contextWindow === 1_000_000 && flash.maxTokens === 384_000,
+		flash,
+	);
+	const kimi = provider?.config.models?.find((model) => model.id === "moonshotai/Kimi-K3");
+	expect("provider: every catalogue entry is priced and sized", provider?.config.models?.every((model) => model.cost.input > 0 && model.contextWindow > 0 && model.maxTokens > 0), provider?.config.models?.[0]);
 
 	// Dynamic discovery is what fills the catalogue once a key exists.
 	expect("discovery: without a key nothing is fetched", (await provider.config.fetchDynamicModels(undefined)).length === 0);
 
-	// No response yet: the segment says so rather than inventing numbers.
-	expect("segment: present and honest before any request", host.row?.includes("LITHOS") && host.row.includes("ready"), host.row);
+	// The row is DeepSeek's layout with this provider's tag where `DS` sits: the account, the
+	// session cost. Speed and budget are the section's, so they never appear here.
+	expect("row: the account tag rides the balance segment", host.row?.includes("LITHOS"), host.row);
 
-	// A response whose budgets were consulted.
+	// A response whose budgets were consulted: they feed the section and omp's usage surface,
+	// not the row.
 	await host.fire("after_provider_response", { status: 200, headers: HEADERS, requestId: "r1" });
-	expect("segment: budget buckets appear", host.row?.includes("req 58/60") && host.row.includes("tok 131k/256k"), host.row);
+	expect("row: budget buckets stay off the row", !host.row?.includes("req 58/60") && !host.row?.includes("tok 131k/256k"), host.row);
 
 	// Speed is measured, not assumed: 400 output tokens over a 500 ms stream.
 	const realNow = Date.now;
@@ -165,17 +199,30 @@ await withConfig({}, async () => {
 	} finally {
 		Date.now = realNow;
 	}
-	expect("speed: 400 tokens in 500 ms reads as 800 tok/s", host.row?.includes("800 tok/s"), host.row);
+	// 400 tokens in 500 ms is 800 tok/s; the row shows the cost and none of the measurement.
+	expect("row: the measured speed stays off the row", !host.row?.includes("800 tok/s"), host.row);
+	expect("row: the cost figure is DeepSeek's", host.row?.includes("used $0."), host.row);
 
-	// A refusal is visible, with the advice the docs say to prefer.
+	// A refusal is visible, with the advice the docs say to prefer — in the section.
 	await host.fire("after_provider_response", { status: 429, headers: { ...HEADERS, "retry-after-ms": "2000", "x-should-retry": "false" } });
-	expect("segment: refusal and retry advice", host.row?.includes("\u2717 429") && host.row.includes("retry 2s"), host.row);
+	expect("row: a refusal does not add a row part", !host.row?.includes("\u2717 429"), host.row);
 
 	await host.commands.get("mega").handler("lithos", host.ctx);
 	const report = host.rendered;
 	expect("report: names the endpoint", report.includes(LITHOS_BASE_URL));
-	expect("report: states the rates are unset rather than faking cost", report.includes("not configured"), report.slice(0, 400));
+	expect(
+		"report: names the published rates and their source rather than faking cost",
+		report.includes("$2.4/Mtok in") && report.includes("$0.24/Mtok cached") && report.includes("www.lithosai.com/pricing"),
+		report.slice(0, 500),
+	);
 	expect("report: reports the measured speed", /p50 800 tok\/s/.test(report), report.slice(0, 900));
+	expect(
+		"report: shows what the session cost, from the same ledger as DeepSeek",
+		report.includes("- Cost: $0.0172 (main $0.0172 + agents $0.0000) — the per-bucket table is in `/mega balance`."),
+		report.slice(-500),
+	);
+	// The row carries the same figure at currency precision, which is what the user watches.
+	expect("row: the session cost is on the row", host.row?.includes("used $0.02"), host.row);
 	expect("report: explains the buckets are balances", report.includes("refill continuously"));
 	expect("report: surfaces the last refusal", report.includes("HTTP 429"));
 
@@ -183,10 +230,10 @@ await withConfig({}, async () => {
 	const native = provider.config.usage.parseRateLimitHeaders(HEADERS, 2_000);
 	expect("native usage: same two limits", native?.limits.length === 2, native?.limits);
 
-	// On another provider nothing is measured and no segment is drawn.
+	// On another provider nothing is measured and no account row is drawn.
 	host.setModel({ provider: "openai", id: "gpt-x" });
 	await host.fire("message_end", { message: { role: "assistant", usage: { input: 10, output: 10 } } });
-	expect("gate: no lithos segment on another provider", !host.row?.includes("LITHOS"), host.row);
+	expect("gate: no account row on another provider", host.row === undefined || !host.row.includes("LITHOS"), host.row);
 	await host.commands.get("mega").handler("lithos", host.ctx);
 	expect("gate: the section explains how to sign in", host.rendered.includes(`/login ${LITHOS_PROVIDER}`), host.rendered.slice(-600));
 
@@ -316,7 +363,14 @@ await withConfig({}, async () => {
 			expect("catalogue: every served id is declared, in the service's order", declared.join(",") === SERVED.join(","), declared);
 			// The model the user asked for by name, and the name the console gives it.
 			const deepseek = provider.config.models.find((model) => model.id === "deepseek-ai/DeepSeek-V4.1-Flash");
-			expect("catalogue: DeepSeek V4.1 Flash is declared with its console name", deepseek?.name === "DeepSeek V4.1 Flash on LithosAI", deepseek);
+			expect("catalogue: DeepSeek V4.1 Flash keeps the console's own name", deepseek?.name === "DeepSeek V4.1 Flash", deepseek);
+			// The picker is already inside LithosAI's list, so an "on LithosAI" suffix only
+			// widens the column that shows the model's name.
+			expect(
+				"catalogue: declared names match the catalogue and carry no provider suffix",
+				provider.config.models.every((model) => model.name === LITHOS_CATALOGUE.find((entry) => entry.id === model.id)?.name),
+				provider.config.models.map((model) => model.name),
+			);
 			expect("catalogue: every entry is loadable as-is", provider.config.models.every((model) => model.name && model.contextWindow > 0 && model.maxTokens > 0 && model.cost), provider.config.models[0]);
 
 			// The same id has to be the same entry whether it arrives declared or discovered:
@@ -340,8 +394,10 @@ await withConfig({}, async () => {
 				discovered,
 			);
 			expect(
-				"catalogue: an id the bundle does not know is still registered",
-				discovered.find((model) => model.id === "zai/GLM-5.3")?.name === "zai/GLM-5.3 on LithosAI",
+				"catalogue: an id the bundle does not know is still registered, at the conservative limits",
+				discovered.find((model) => model.id === "zai/GLM-5.3")?.name === "zai/GLM-5.3" &&
+					discovered.at(-1).contextWindow === LITHOS_FALLBACK_CONTEXT_WINDOW &&
+					discovered.at(-1).maxTokens === LITHOS_FALLBACK_MAX_TOKENS,
 				discovered.at(-1),
 			);
 
@@ -402,5 +458,27 @@ await withConfig({ "lithos.inputPerMillion": 0.6, "lithos.outputPerMillion": 2.4
 	expect("rates: configured rates reach the model cost", provider?.config.models?.[0]?.cost.input === 0.6 && provider.config.models[0].cost.cacheRead === 0.06, provider?.config.models?.[0]?.cost);
 	expect("rates: output rate carried too", provider?.config.models?.[0]?.cost.output === 2.4, provider?.config.models?.[0]?.cost);
 });
+
+// Precedence, per rate: the published card prices whatever the config leaves at 0.
+const published = lithosRates("moonshotai/Kimi-K3", { input: 0, cached: 0, output: 0 });
+expect(
+	"rates: an unset override falls through to the published card",
+	published.input === 2.4 && published.cached === 0.24 && published.output === 12 && published.source === "published",
+	published,
+);
+const mixed = lithosRates("moonshotai/Kimi-K3", { input: 0.6, cached: 0, output: 0 });
+expect(
+	"rates: a configured rate wins and the source names it",
+	mixed.input === 0.6 && mixed.cached === 0.24 && mixed.output === 12 && mixed.source.includes("lithos.inputPerMillion overriding"),
+	mixed,
+);
+const unknown = lithosRates("zai/GLM-5.3", { input: 0, cached: 0, output: 0 });
+expect("rates: an unpriced id reports unknown rather than a zero price", unknown.source === "unknown" && unknown.input === 0, unknown);
+const unknownConfigured = lithosRates("zai/GLM-5.3", { input: 1.5, cached: 0, output: 0 });
+expect(
+	"rates: an unpriced id prices from the config alone",
+	unknownConfigured.source === "lithos.inputPerMillion" && unknownConfigured.input === 1.5 && unknownConfigured.output === 0,
+	unknownConfigured,
+);
 
 done();

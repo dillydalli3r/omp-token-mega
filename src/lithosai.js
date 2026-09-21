@@ -17,11 +17,20 @@
  *             remaining values are balances that refill continuously, so they are
  *             reported as balances, never as "limit minus spend this minute".
  *   cost      prepaid credit, debited per token at three rates (input, cached input,
- *             output). The rates live in the console rather than the API, so they are
- *             configured here; until they are, a session's cost reads as unknown.
+ *             output). The API publishes none of them and `/models` carries ids and owners
+ *             only, so the rates are declared from LithosAI's public price list, with
+ *             `lithos.*PerMillion` as the override for a console figure that differs.
+ *             A model nobody priced reports "unknown" rather than a zero bill.
+ *
+ * The session's cost, cached tokens and spend table are the balance feature's
+ * (`/mega balance`), which works the same on either metered provider — so a LithosAI session
+ * shows DeepSeek's row: the same cache figures, the same `used $` cost, and this provider's
+ * tag where `DS` sits, supplied by the balance segment rather than by this module. The
+ * speed and budget this module measures are the report's (`/mega lithos`) and omp's own
+ * usage surface's (`/usage`), never extra parts on the status row.
  *
  * Everything is scoped to the LithosAI provider: on any other model nothing is registered,
- * nothing is polled, and no segment is drawn. The provider registration itself is the
+ * nothing is polled, and no metric is recorded. The provider registration itself is the
  * exception — it exists so a LithosAI model is *available* to load in the first place.
  *
  * Auth is one key, and it comes from a `/login lithosai` credential or from the *value* of
@@ -36,42 +45,90 @@
 
 import { activeModel } from "./model.js";
 import { sessionSpend } from "./usage.js";
-import { formatTokens, money, timing } from "./measure.js";
+import { money, timing } from "./measure.js";
 
 export const LITHOS_PROVIDER = "lithosai";
 export const LITHOS_BASE_URL = "https://api.lithosai.cloud/v1";
 export const LITHOS_KEY_ENV = "LITHOSAI_API_KEY";
 export const LITHOS_CONSOLE_KEYS_URL = "https://console.lithosai.cloud/keys";
+/** Where the prepaid balance and the per-model spend are actually reported. */
+export const LITHOS_BILLING_URL = "https://console.lithosai.cloud/billing";
+/** The public price list the bundled rates come from. */
+export const LITHOS_PRICING_URL = "https://www.lithosai.com/pricing";
+export const LITHOS_PRICING_RETRIEVED = "2026-09-20";
 
 /**
- * The models LithosAI serves, in the order the service reports them from `/v1/models`.
+ * The models LithosAI serves, with the specs and rates the service publishes.
  *
- * The registration declares every one of them, because a picker can only offer what the
- * provider slice holds: `fetchDynamicModels` runs *after* the provider loads and its result
- * is cached, so an install whose endpoint is unreachable — a filtered resolver, an offline
- * machine, a key that has not been pasted yet — would otherwise show a single model and look
- * like the service had one. The live catalogue still wins wherever it answers: it is
- * authoritative for the provider, and any id that is not in this list is registered as
- * discovered. Ids and owners come from that same endpoint; limits come from the omp guide,
- * because `/models` reports neither limits nor rates.
+ * Three numbers per model matter here, and the API reports none of them: `/models` carries
+ * ids and owners only. So they are declared, from LithosAI's own sources, and can be
+ * overridden per rate with `lithos.*PerMillion`.
+ *
+ *   rates          the public price list (LITHOS_PRICING_URL, retrieved
+ *                  LITHOS_PRICING_RETRIEVED): the early-access card, which is what the
+ *                  console bills while the discount holds. Without them a session cannot
+ *                  price its own tokens — the row's `used $` and every cost column read
+ *                  zero, which is what "cost is unknown" has to look like rather than a
+ *                  wrong number.
+ *   contextWindow  the published window. Each model's own figure, taken from the same
+ *                  model in omp's catalog: Kimi K3 declares 2^20, DeepSeek V4.1 Flash
+ *                  declares 1000000.
+ *   maxTokens      the published output ceiling, same source. A wrong value here is not
+ *                  cosmetic: omp sends `max_tokens` for Kimi-family models, so an
+ *                  understated ceiling truncates generations and an overstated one is
+ *                  refused by the endpoint.
+ *
+ * Ids the live `/models` reports and this list does not know keep the conservative
+ * fallbacks below and price at zero until `lithos.*PerMillion` is set.
  */
 export const LITHOS_CATALOGUE = [
-	{ id: "deepseek-ai/DeepSeek-V4.1-Flash", name: "DeepSeek V4.1 Flash" },
-	{ id: "moonshotai/Kimi-K3", name: "Kimi K3" },
-	{ id: "moonshotai/Kimi-K3-fast", name: "Kimi K3 Fast" },
-	{ id: "moonshotai/Kimi-K3-ultra", name: "Kimi K3 Ultra" },
+	{
+		id: "deepseek-ai/DeepSeek-V4.1-Flash",
+		name: "DeepSeek V4.1 Flash",
+		tier: "Base",
+		contextWindow: 1_000_000,
+		maxTokens: 384_000,
+		rates: { input: 0.15, cached: 0.003, output: 0.6 },
+	},
+	{
+		id: "moonshotai/Kimi-K3",
+		name: "Kimi K3",
+		tier: "Base",
+		contextWindow: 1_048_576,
+		maxTokens: 131_072,
+		rates: { input: 2.4, cached: 0.24, output: 12 },
+	},
+	{
+		id: "moonshotai/Kimi-K3-fast",
+		name: "Kimi K3 Fast",
+		tier: "Fast",
+		contextWindow: 1_048_576,
+		maxTokens: 131_072,
+		rates: { input: 4, cached: 0.4, output: 20 },
+	},
+	{
+		id: "moonshotai/Kimi-K3-ultra",
+		name: "Kimi K3 Ultra",
+		tier: "Ultra",
+		contextWindow: 1_048_576,
+		maxTokens: 131_072,
+		rates: { input: 5.6, cached: 0.56, output: 28 },
+	},
 ];
 
-/** The model LithosAI's own omp guide names as the default. */
-export const LITHOS_DEFAULT_MODEL = "moonshotai/Kimi-K3";
-export const LITHOS_CONTEXT_WINDOW = 262_144;
-export const LITHOS_MAX_TOKENS = 32_768;
+/** Declared limits for an id the bundle does not know: the floor every LithosAI model meets. */
+export const LITHOS_FALLBACK_CONTEXT_WINDOW = 262_144;
+export const LITHOS_FALLBACK_MAX_TOKENS = 32_768;
+
+export function isLithosModel(model) {
+	return model?.provider === LITHOS_PROVIDER;
+}
 
 /** Where the plugin attaches; matches `activeModel(ctx)`.
  * `ctx.models.current()` reflects `/model` switches, so a LithosAI conversation that
  * moves to another provider stops being measured on the next event. */
 export function isLithos(ctx) {
-	return activeModel(ctx)?.provider === LITHOS_PROVIDER;
+	return isLithosModel(activeModel(ctx));
 }
 
 const int = (value) => {
@@ -141,21 +198,67 @@ export function parseRateLimitHeaders(headers, now = Date.now()) {
 }
 
 /**
+ * One rate: the configured override when one is set, otherwise the model's published
+ * figure, otherwise zero — zero meaning "unknown", never a price.
+ */
+function rateOf(overrides, published, kind) {
+	const override = Number(overrides?.[kind]) || 0;
+	return override > 0 ? override : (published?.[kind] ?? 0);
+}
+
+/**
  * One model registration entry. Static and discovered models go through here so the same id
  * is the same entry either way: omp merges the two by id, and a name that changed with the
  * source would rename a model under the user every time discovery succeeded.
+ *
+ * Rates come from the published card unless `lithos.*PerMillion` overrides them, because an
+ * unread rate makes every cost in this plugin read `$0` — an entry registered without one
+ * cannot price the tokens it is billed for.
  */
-function modelSpec(id, rates) {
+function modelSpec(id, overrides) {
 	const known = LITHOS_CATALOGUE.find((entry) => entry.id === id);
+	const published = known?.rates;
 	return {
 		id,
-		name: `${known?.name ?? id} on LithosAI`,
+		name: known?.name ?? id,
 		reasoning: true,
 		input: ["text"],
-		cost: { input: rates.input, output: rates.output, cacheRead: rates.cached, cacheWrite: 0 },
-		contextWindow: LITHOS_CONTEXT_WINDOW,
-		maxTokens: LITHOS_MAX_TOKENS,
+		cost: {
+			input: rateOf(overrides, published, "input"),
+			output: rateOf(overrides, published, "output"),
+			cacheRead: rateOf(overrides, published, "cached"),
+			cacheWrite: 0,
+		},
+		contextWindow: known?.contextWindow ?? LITHOS_FALLBACK_CONTEXT_WINDOW,
+		maxTokens: known?.maxTokens ?? LITHOS_FALLBACK_MAX_TOKENS,
 	};
+}
+
+/**
+ * The effective rates of one model, with where each figure came from: `{ input, cached,
+ * output, source }` where `source` is `"published"`, `"configured"`, a mix
+ * (`"published + lithos.inputPerMillion"`), or `"unknown"` when neither source priced it.
+ * The section reads this instead of re-deriving the precedence, so what it prints and what
+ * the registration bills cannot disagree.
+ */
+export function lithosRates(modelId, overrides = {}) {
+	const published = LITHOS_CATALOGUE.find((entry) => entry.id === modelId)?.rates;
+	const rates = {
+		input: rateOf(overrides, published, "input"),
+		cached: rateOf(overrides, published, "cached"),
+		output: rateOf(overrides, published, "output"),
+	};
+	const kinds = ["input", "cached", "output"];
+	const fromConfig = kinds.filter((kind) => (Number(overrides?.[kind]) || 0) > 0);
+	const known = rates.input > 0 || rates.cached > 0 || rates.output > 0;
+	const source = !known
+		? "unknown"
+		: fromConfig.length === 0
+			? "published"
+			: published
+				? `published, with ${fromConfig.map((kind) => `lithos.${kind}PerMillion`).join(" and ")} overriding`
+				: fromConfig.map((kind) => `lithos.${kind}PerMillion`).join(" and ");
+	return { ...rates, source };
 }
 
 /**
@@ -409,6 +512,26 @@ export function installLithos(pi, shell) {
 		state.requests = 0;
 	}
 
+	/** The window and the output ceiling the registration declares for an id. */
+	function declaredLimits(modelId) {
+		const known = LITHOS_CATALOGUE.find((entry) => entry.id === modelId);
+		const window = known?.contextWindow ?? LITHOS_FALLBACK_CONTEXT_WINDOW;
+		const output = known?.maxTokens ?? LITHOS_FALLBACK_MAX_TOKENS;
+		const source = known ? `published, the ${known.tier} tier` : "fallback — the id is not in the bundled catalogue";
+		return `${window.toLocaleString("en-US")} tokens, ${output.toLocaleString("en-US")} max output (${source})`;
+	}
+
+	/** The effective rates for an id, and which source priced each figure. */
+	function ratesLine(modelId) {
+		const effective = lithosRates(modelId, rates());
+		if (effective.source === "unknown") {
+			return "- Rates: unknown for this id — the bundled card does not price it and no `lithos.*PerMillion` is set, so cost reads $0.";
+		}
+		const provenance =
+			effective.source === "published" ? `published card, ${LITHOS_PRICING_URL} (retrieved ${LITHOS_PRICING_RETRIEVED})` : effective.source;
+		return `- Rates: $${effective.input}/Mtok in, $${effective.cached}/Mtok cached, $${effective.output}/Mtok out — ${provenance}.`;
+	}
+
 	/**
 	 * The last `/models` outcome, in one line: when it answered, what it served and which of
 	 * those ids the bundled catalogue does not know; when it did not, why — because "the
@@ -423,26 +546,6 @@ export function installLithos(pi, shell) {
 		const fresh = seen.ids.filter((id) => !bundled.has(id));
 		const served = `${seen.ids.length} model(s) at ${at} UTC`;
 		return fresh.length > 0 ? `${served}, new: ${fresh.map((id) => `\`${id}\``).join(", ")}` : `${served}, all in the bundled catalogue`;
-	}
-
-	/** One row segment: measured speed, the remaining per-minute budgets, and any refusal. */
-	function segment() {
-		if (!values().enabled || !values()["lithos.enabled"] || !isLithos(state.ctx)) return undefined;
-		const parts = ["LITHOS"];
-		if (Number(state.lastStatus) >= 400) {
-			const retry = state.budgets?.retryAfterMs;
-			parts.push(`\u2717 ${state.lastStatus}${retry ? ` retry ${Math.round(retry / 1000)}s` : ""}`);
-		}
-		const speed = timing(state.speeds);
-		if (speed) parts.push(`${Math.round(speed.median)} tok/s`);
-		const requests = state.budgets?.requests;
-		if (requests?.limit > 0 && requests.remaining !== undefined) parts.push(`req ${requests.remaining}/${requests.limit}`);
-		const tokens = state.budgets?.tokens;
-		if (tokens?.limit > 0 && tokens.remaining !== undefined) {
-			parts.push(`tok ${formatTokens(tokens.remaining)}/${formatTokens(tokens.limit)}`);
-		}
-		if (parts.length === 1) parts.push(state.requests > 0 ? `${state.requests} req` : "ready");
-		return parts.join(" \u00b7 ");
 	}
 
 	/** Markdown section for `/mega`, `/mega lithos`. */
@@ -461,12 +564,8 @@ export function installLithos(pi, shell) {
 			return lines.join("\n");
 		}
 		lines.push(`- Model: \`${model?.id ?? "unknown"}\``);
-		const ratesNow = rates();
-		lines.push(
-			ratesNow.input > 0 || ratesNow.output > 0
-				? `- Rates: $${ratesNow.input}/Mtok in, $${ratesNow.cached}/Mtok cached, $${ratesNow.output}/Mtok out (\`lithos.*PerMillion\`)`
-				: "- Rates: not configured, so session cost reads $0 — set `lithos.inputPerMillion`, `lithos.cachedPerMillion` and `lithos.outputPerMillion` from the console.",
-		);
+		lines.push(`- Declared limits: ${declaredLimits(model?.id)}`);
+		lines.push(ratesLine(model?.id));
 		lines.push(`- Responses measured this session: ${state.requests}`);
 
 		const speed = timing(state.speeds);
@@ -501,24 +600,20 @@ export function installLithos(pi, shell) {
 		if (Number(state.lastStatus) >= 400) lines.push("", `Last provider response: HTTP ${state.lastStatus}.`);
 
 		{
+			// The cost ledger is the account section's (`/mega balance`), which shows the same
+			// main/agents/total table for every provider this plugin prices; this section names
+			// the figure so "what did LithosAI cost me" is answered here too, once.
+			const ratesNow = lithosRates(model?.id, rates());
 			lines.push("", "#### This session", "");
-			lines.push("| bucket | cost (USD) | input | output | cache read | calls |");
-			lines.push("| --- | ---: | ---: | ---: | ---: | ---: |");
-			for (const [label, totals] of [
-				["main", spend.parent],
-				["agents", spend.agents],
-				["total", spend.total],
-			]) {
-				lines.push(
-					`| ${label} | ${money(totals.cost)} | ${totals.input.toLocaleString("en-US")} | ${totals.output.toLocaleString("en-US")} | ${totals.cacheRead.toLocaleString("en-US")} | ${totals.calls} |`,
-				);
-			}
-			if (spend.hitRate !== undefined) {
-				lines.push("", `Cached-input share: **${Math.round(spend.hitRate * 100)}%** of billed input tokens.`);
-			}
+			lines.push(
+				ratesNow.source === "unknown"
+					? `- Cost: unknown — set \`lithos.inputPerMillion\`, \`lithos.cachedPerMillion\` and \`lithos.outputPerMillion\`; until then every cost reads $0.`
+					: `- Cost: $${money(spend.total.cost)} (main $${money(spend.parent.cost)} + agents $${money(spend.agents.cost)}) — the per-bucket table is in \`/mega balance\`.`,
+			);
+			lines.push(`- Tokens billed: ${spend.total.input.toLocaleString("en-US")} input, ${spend.total.cacheRead.toLocaleString("en-US")} cached, ${spend.total.output.toLocaleString("en-US")} output over ${spend.total.calls} call(s).`);
 		}
 		return lines.join("\n");
 	}
 
-	return { segment, section, reset, state };
+	return { section, reset, state };
 }

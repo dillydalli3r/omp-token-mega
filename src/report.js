@@ -2,14 +2,27 @@
  * The `/mega` report: one document, one section per feature, plus the token audit's
  * accounting of where the session's input tokens actually go.
  *
- * The token section keeps the prefix-safety paragraph verbatim, because it is the
- * plugin's contract and it is stated in terms the reader can check against the code:
- * which events are subscribed to, and what a subscriber is allowed to return.
+ * The token section's prefix-safety paragraph is the plugin's contract, written in terms
+ * the reader can check against the code rather than as a promise: which event the reducer
+ * subscribes to, what a subscriber is allowed to return, and which figures the cache side
+ * of the ledger can and cannot price.
  */
 
 import { formatBytes, formatTokens, tokensFromBytes } from "./measure.js";
 
-/** Section for the tool-result reducer. */
+/**
+ * Section for the tool-result reducer.
+ *
+ * The accounting rows are the reducer's ledger (`emptyStats` in `token.js`), printed so
+ * that it adds up on the page: the three component figures are the *gross* bytes the
+ * passes named on each line removed, and the provenance markers those same rewrites wrote
+ * into the results are subtracted once — in the headline and again as a row of their own.
+ * So
+ *
+ *   lossless + budget elision + duplicates collapsed - markers === stats.savedBytes
+ *
+ * holds for the figures as printed.
+ */
 export function tokenSection({ config, stats, perf, index, model }) {
 	const values = config.values;
 	const lines = ["### Token saving", ""];
@@ -21,13 +34,19 @@ export function tokenSection({ config, stats, perf, index, model }) {
 	}
 	lines.push(`- Tool results in scope: ${stats.results} (tools: \`${values["token.tools"]}\`)`);
 	lines.push(`- Results rewritten: ${stats.reduced}`);
+	const byRule = stats.byRule;
+	const lossless = byRule.squeeze + byRule.fold + byRule.clip + byRule.json;
+	const gross = lossless + byRule.elide + byRule.dedupe;
 	lines.push(
-		`- Removed from the transcript: ${formatBytes(stats.savedBytes)} (~${formatTokens(tokensFromBytes(stats.savedBytes))} tok, est.), net of ${formatBytes(stats.markerBytes)} of provenance markers`,
+		`- Removed from the transcript: ${formatBytes(stats.savedBytes)} (~${formatTokens(tokensFromBytes(stats.savedBytes))} tok, est.) — ${formatBytes(gross)} removed by the passes below, less ${formatBytes(stats.markerBytes)} of provenance markers`,
 	);
 	lines.push(
-		`  - lossless passes ${formatBytes(stats.byRule.squeeze + stats.byRule.fold + stats.byRule.clip + stats.byRule.json)} (squeeze ${formatBytes(stats.byRule.squeeze)}, fold ${formatBytes(stats.byRule.fold)}, clip ${formatBytes(stats.byRule.clip)}, json ${formatBytes(stats.byRule.json)})`,
+		`  - lossless passes ${formatBytes(lossless)} (squeeze ${formatBytes(byRule.squeeze)}, fold ${formatBytes(byRule.fold)}, clip ${formatBytes(byRule.clip)}, json ${formatBytes(byRule.json)})`,
 	);
-	lines.push(`  - budget elision ${formatBytes(stats.byRule.elide)}; duplicates collapsed ${formatBytes(stats.byRule.dedupe)}`);
+	lines.push(`  - budget elision ${formatBytes(byRule.elide)}; duplicates collapsed ${formatBytes(byRule.dedupe)}`);
+	lines.push(
+		`  - provenance markers written into the reduced results: ${formatBytes(stats.markerBytes)} (a marker is never a saving: those bytes are in the results and are subtracted above)`,
+	);
 	lines.push(`- Duplicate index: ${index.size} distinct result(s); ${stats.duplicates} copy(ies) collapsed.`);
 	lines.push(`- Artifacts written: ${stats.stashes}; write failures: ${stats.stashFailures}.`);
 	lines.push(
@@ -36,16 +55,16 @@ export function tokenSection({ config, stats, perf, index, model }) {
 
 	lines.push("", "#### Prefix-cache safety", "");
 	lines.push(
-		"- This plugin touches exactly one thing: the content of a tool result, **before** it is first persisted and sent. Reduced text is what the session stores, so every later request replays the same bytes.",
+		"- The reducer touches exactly one thing: the content of a tool result, **before** it is first persisted and sent. Reduced text is what the session stores, so every later request replays the same bytes: the prefix stays byte-stable, and a saving earned once is paid out again on every request that follows it.",
 	);
 	lines.push(
-		"- It registers no `context`, `before_provider_request` or `before_agent_start` handler and no content-replacing tool: the system prompt, the tool catalogue and the message log are exactly what omp would have built without it. That is the whole reason it cannot turn a cache hit into a miss.",
+		"- It subscribes to exactly one event whose return value can change what the model sees, `tool_result`, and returns only a content replacement: no `context`, `before_provider_request` or `before_agent_start` handler, and no content-replacing tool. The handlers it does register — `session_start`, `session_switch`, `tool_execution_start`, `session_shutdown` — return nothing. The system prompt, the tool catalogue and the message log are exactly what omp would have built without it, which is the whole reason it cannot turn a cache hit into a miss.",
 	);
 	lines.push(
-		"- A rewrite is admitted only when it pays for its own provenance marker (`token.minSavingsTokens`); otherwise the original bytes go out untouched, because a pointless rewrite would fork the prefix for nothing.",
+		"- A rewrite is admitted only when it pays for its own provenance marker (`token.minSavingsTokens`), and the marker's bytes are subtracted from the saving rather than counted as one, so the figure above is net of them. A rewrite that does not pay is not made: forking the prefix for nothing costs more than sending the original bytes.",
 	);
 	lines.push(
-		"- Elided tokens are never sent, so they never enter the provider's cache accounting at all. Cache-hit rate and cache savings are unaffected and are measured by the `cache.*` side of this plugin — the two numbers are not additive.",
+		"- Elided tokens are never sent, so they never enter the provider's prefix cache at all — and they cannot appear in the cached-input counts the `cache.*` side prices either, because a token that was never sent was never cached. The `cache.*` side measures the hit rate and the saving over what *is* sent, for every provider whose models report cached input tokens; the two figures answer different questions and are not additive.",
 	);
 	lines.push(
 		"- omp's own history-level reductions (artifact spill, `pruneToolOutputs`, `supersedeReads`, `dropUseless`, `shake`) run on their own cache-aware schedule and are left alone; when omp has already elided a result, this plugin only compresses what remains.",

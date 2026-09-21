@@ -10,7 +10,7 @@
  *   node test/shell.test.mjs
  */
 
-import { checks, DEEPSEEK_MODEL, makeHost, SCHEDULED_MODEL, STATUS_KEY, tick, withConfig } from "./harness.mjs";
+import { checks, DEEPSEEK_MODEL, makeHost, OPENCODE_MODEL, SCHEDULED_MODEL, STATUS_KEY, tick, withConfig } from "./harness.mjs";
 import { CONFIG_KEYS, CONFIG_SCHEMA, KEY_GROUPS, STATUS_SEGMENTS, statusSegmentNames } from "../src/config.js";
 import { composeRow, renderRow, TINTS } from "../src/status.js";
 
@@ -35,7 +35,7 @@ const { expect, done } = checks();
 	expect("composition: unknown segment names are ignored", unknown === "DS cache 87% \u00b7 TS -1.0 KB", unknown);
 
 	// A feature with nothing to say is absent from the map, not mapped to a placeholder.
-	const absent = renderRow(composeRow({ names: ["cache", "lithos"], segments, maxChars: 120 }));
+	const absent = renderRow(composeRow({ names: ["cache", "nope"], segments, maxChars: 120 }));
 	expect("composition: an absent feature contributes nothing", absent === "DS cache 87%", absent);
 	const partial = renderRow(composeRow({ names, segments: { cache: "DS cache 87%", balance: undefined, token: "TS -1.0 KB" }, maxChars: 120 }));
 	expect("composition: a gated-off feature is skipped, not blanked", partial === "DS cache 87% \u00b7 TS -1.0 KB", partial);
@@ -96,7 +96,7 @@ await withConfig({}, async () => {
 
 	expect("row: the plugin publishes exactly one widget key, ever", host.rowKeys.length === 1 && host.rowKeys[0] === STATUS_KEY, host.rowKeys);
 	expect("row: the key is the plugin's own", STATUS_KEY === "omp-token-mega", STATUS_KEY);
-	expect("row: cache segment present", host.row?.includes("DS cache"), host.row);
+	expect("row: cache segment present", host.row?.includes("cache"), host.row);
 	expect("row: balance segment present", host.row?.includes("used $"), host.row);
 	expect("row: token segment present", host.row?.includes("TS "), host.row);
 	expect("row: one line, never a newline", !host.row?.includes("\n"), host.row);
@@ -180,10 +180,54 @@ await withConfig({ statusSegments: "nope" }, async () => {
 	expect("tint: a row with no tariff note carries no colour at all", Boolean(flat.row) && !(flat.tint ?? "").includes("\u001b"), flat.tint);
 }
 
+// ----------------------------------------------------------------- the row's append-only advice
+
+// The warning is earned, not decorative: it waits for a miss this session actually recorded,
+// and for a provider omp will not pin the prefix on by itself. Until a request has been
+// measured there is nothing to advise about, which is exactly what the row says.
+await withConfig({}, async () => {
+	const host = await makeHost({ model: OPENCODE_MODEL });
+	await host.start();
+	await tick();
+	expect(
+		"append-only: the cache segment is drawn, with no advice before a request is measured",
+		typeof host.row === "string" && host.row.includes("cache: no requests yet") && !host.row.includes("append-only"),
+		host.row,
+	);
+
+	await host.fire("before_agent_start", { systemPrompt: ["you are omp"] });
+	await host.request([1, 2], [{ function: { name: "bash" } }]);
+	// A response reporting no cached read is a miss — the event the advice hangs off.
+	await host.response({ input: 10_000, output: 100, cacheRead: 0, cacheWrite: 0, cost: { total: 0.003 } });
+	expect("append-only: a measured miss on a provider omp leaves alone draws the warning", host.row?.includes("\u26a0 append-only off"), host.row);
+	expect("append-only: it is drawn as the yellow nudge, not as an error", host.tint?.includes("\u001b[33m\u26a0 append-only off"), host.tint);
+	expect("append-only: the measurement it was drawn beside stays on the row", host.row?.includes("cache 0%"), host.row);
+});
+
+// `cache.appendOnly=false` is the user saying they have read the advice: the part goes, the
+// measurement that produced it does not.
+await withConfig({ "cache.appendOnly": false }, async () => {
+	const host = await makeHost({ model: OPENCODE_MODEL });
+	await host.start();
+	await tick();
+	await host.fire("before_agent_start", { systemPrompt: ["you are omp"] });
+	await host.request([1, 2], [{ function: { name: "bash" } }]);
+	await host.response({ input: 10_000, output: 100, cacheRead: 0, cacheWrite: 0, cost: { total: 0.003 } });
+	expect("append-only: the setting suppresses the part, not the measurement", !host.row?.includes("append-only") && host.row?.includes("cache 0%"), host.row);
+	expect("append-only: the rest of the row is untouched", host.row?.includes("GO \u00b7 used $0.00"), host.row);
+});
+
 // ----------------------------------------------------------------- segment list rules
 
 {
-	expect("segments: every segment name is a schema-documented group", STATUS_SEGMENTS.every((name) => ["cache", "lithos", "balance", "token"].includes(name)), STATUS_SEGMENTS);
+	// Every group the row can compose is a documented settings group, and the default list is
+	// exactly the groups the row builds — a name with no feature behind it would be a promise
+	// the row never keeps.
+	expect(
+		"segments: every segment name is a schema-documented group",
+		STATUS_SEGMENTS.every((name) => CONFIG_KEYS.some((key) => key === name || key.startsWith(`${name}.`))),
+		STATUS_SEGMENTS,
+	);
 	expect(
 		"segments: the default list is drawn from the known names",
 		statusSegmentNames({ statusSegments: CONFIG_SCHEMA.statusSegments.default }).join() === STATUS_SEGMENTS.join(),
@@ -192,6 +236,9 @@ await withConfig({ statusSegments: "nope" }, async () => {
 	expect("segments: duplicates collapse", statusSegmentNames({ statusSegments: "token,token,cache" }).join() === "token,cache");
 	expect("segments: whitespace and case are tolerated", statusSegmentNames({ statusSegments: " Token , CACHE " }).join() === "token,cache");
 	expect("segments: an unknown name is dropped, not rendered", statusSegmentNames({ statusSegments: "token,nope" }).join() === "token");
+	// A group that no longer exists is dropped like any other unknown name: the row keeps the
+	// metrics on the balance segment, so `lithos` never resolved to a segment of its own.
+	expect("segments: a removed group is tolerated in a stored list", statusSegmentNames({ statusSegments: "lithos,token" }).join() === "token");
 }
 
 // ----------------------------------------------------------------- the one command
@@ -206,17 +253,21 @@ await withConfig({}, async () => {
 	for (const legacy of ["tokens", "deepseek-cache", "deepseek-balance"]) {
 		expect(`command: no legacy /${legacy}`, !host.commands.has(legacy));
 	}
-	expect("tool: the balance tool is still exposed", [...host.tools.keys()].join() === "deepseek_balance", [...host.tools.keys()]);
+	expect("tool: the account tool is still exposed", [...host.tools.keys()].join() === "account_balance", [...host.tools.keys()]);
 
 	const command = host.commands.get("mega");
 	await command.handler("help", host.ctx);
-	expect("command: help lists the merged surface", host.rendered.includes("/mega cache [doctor|fix|rollback]"), host.rendered.slice(0, 600));
+	expect("command: help lists the merged surface", host.rendered.includes("/mega cache [report|doctor|fix|rollback|stability]"), host.rendered.slice(0, 600));
 	expect("command: help covers lithos", host.rendered.includes("/mega lithos"));
+	// The cache line is the only place a user learns the action exists, so it has to name
+	// it and say what it answers.
+	const cacheHelp = host.rendered.split("\n").find((line) => line.includes("/mega cache [")) ?? "";
+	expect("command: help lists stability among the cache actions, and what it answers", cacheHelp.includes("stability") && cacheHelp.includes("append-only"), cacheHelp);
 	await command.handler("nonsense-subcommand", host.ctx);
 	expect("command: an unknown subcommand falls back to the report", host.rendered.includes("# Token Mega"), host.rendered.slice(0, 120));
 
 	await command.handler("status", host.ctx);
-	expect("command: status prints the row's text", host.notified.includes("DS cache") || host.notified.includes("TS "), host.notified.slice(0, 200));
+	expect("command: status prints the row's text", host.notified.includes("cache") || host.notified.includes("TS "), host.notified.slice(0, 200));
 
 	await command.handler("cache doctor", host.ctx);
 	expect("command: the cache doctor is reachable", host.rendered.includes("Compat-key doctor"), host.rendered.slice(-300));
@@ -231,6 +282,40 @@ await withConfig({}, async () => {
 	const config = host.rendered.slice(host.rendered.indexOf("### Effective configuration"));
 	for (const group of KEY_GROUPS) expect(`config: the ${group.label} group is printed`, config.includes(`**${group.label}**`));
 	expect("config: every key appears", CONFIG_KEYS.every((key) => config.includes(`\`${key}`)), CONFIG_KEYS.filter((key) => !config.includes(`\`${key}`)));
+});
+
+// ----------------------------------------------------------------- prefix stability
+
+// `/mega cache stability` answers the one question the row can only hint at: is omp holding
+// the request prefix still here? On a provider its own rule covers there is nothing to do;
+// on the providers it does not, the answer is a single command for the user to run — this
+// plugin reports the setting and never writes it.
+await withConfig({}, async () => {
+	const host = await makeHost({ model: DEEPSEEK_MODEL });
+	await host.start();
+	await tick();
+	await host.commands.get("mega").handler("cache stability", host.ctx);
+	expect("stability: the block is printed under its own heading", host.rendered.includes("### Prefix stability"), host.rendered.slice(0, 200));
+	expect(
+		"stability: the mode is named as automatic on DeepSeek",
+		host.rendered.includes("Append-only context is automatic on `deepseek/deepseek-flash`"),
+		host.rendered.slice(-400),
+	);
+});
+
+await withConfig({}, async () => {
+	const host = await makeHost({ model: OPENCODE_MODEL });
+	await host.start();
+	await tick();
+	await host.commands.get("mega").handler("cache stability", host.ctx);
+	const text = host.rendered.slice(host.rendered.indexOf("### Prefix stability"));
+	expect(
+		"stability: the mode is named as not automatic on OpenCode Go",
+		text.includes("Append-only context is NOT automatic on `opencode-go/deepseek-v4.1-flash`"),
+		text,
+	);
+	expect("stability: the one command that forces it is named", text.includes("omp config set provider.appendOnlyContext on"), text);
+	expect("stability: and the plugin says it never writes the setting itself", text.includes("this plugin reports the setting and never writes it"), text);
 });
 
 // ----------------------------------------------------------------- the one menu
@@ -314,7 +399,7 @@ await withConfig({}, async () => {
 	await tick();
 	await host.commands.get("mega").handler("", host.ctx);
 	const report = host.rendered;
-	expect("hub: a bare /mega opens the menu and its report action renders the report", report.includes("# Token Mega") && report.includes("### DeepSeek prefix cache"), report.slice(0, 200));
+	expect("hub: a bare /mega opens the menu and its report action renders the report", report.includes("# Token Mega") && report.includes("### Prefix cache"), report.slice(0, 200));
 	expect("hub: a feature entry opens that feature's section", report.includes("### LithosAI"), report.slice(-260));
 	const preset = host.execs.at(-1);
 	expect(

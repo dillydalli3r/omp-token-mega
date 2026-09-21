@@ -72,6 +72,38 @@ export const SCHEDULED_MODEL = {
 	},
 };
 
+/** A Google route the plugin accounts for but whose account surface it never polls. */
+export const GEMINI_MODEL = {
+	provider: "google",
+	id: "gemini-3.5-flash",
+	baseUrl: "https://generativelanguage.googleapis.com/v1beta",
+	cost: { input: 1.5, output: 9, cacheRead: 0.15, cacheWrite: 0 },
+};
+
+/** An OpenCode Go route: accounted for, priced, and with no balance endpoint to call. */
+export const OPENCODE_MODEL = {
+	provider: "opencode-go",
+	id: "deepseek-v4.1-flash",
+	baseUrl: "https://opencode.ai/zen/go/v1",
+	cost: { input: 0.15, output: 0.6, cacheRead: 0.003, cacheWrite: 0 },
+};
+
+/** The same OpenCode Go route with every rate zeroed: accounted for, priced at nothing. */
+export const UNPRICED_MODEL = {
+	provider: "opencode-go",
+	id: "mimo-v2.6-pro",
+	baseUrl: "https://opencode.ai/zen/go/v1",
+	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+};
+
+/** A provider with neither a cache-read rate nor a place among those measured: nothing to account for. */
+export const UNCACHED_MODEL = {
+	provider: "some-proxy",
+	id: "gpt-x",
+	baseUrl: "https://proxy.example.com/v1",
+	cost: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 },
+};
+
 export const ENV_KEYS = Object.values(CONFIG_SCHEMA)
 	.map((schema) => schema.env)
 	.filter(Boolean);

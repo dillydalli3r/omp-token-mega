@@ -1,7 +1,7 @@
 /**
  * The configuration menu for every feature in this plugin.
  *
- * `omp plugin config set` requires knowing the key names, and this plugin has thirty of
+ * `omp plugin config set` requires knowing the key names, and this plugin has dozens of
  * them, so `/mega menu` groups them by feature and edits one at a time. Writes go through
  * omp's own CLI rather than editing the plugin lockfile behind omp's back, so the file it
  * lands in is the file `omp plugin config list` reads, and a shadowed write (an env var,

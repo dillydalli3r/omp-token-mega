@@ -21,6 +21,22 @@
  * the compaction-time prune), so this module deliberately does not reimplement it; the
  * optional budget in `elide()` is a *tighter per-tool* lever that reuses omp's own
  * `artifact://` recovery path rather than inventing a second one.
+ *
+ * The arithmetic here was audited against the reducer's ledger and left as it was, because
+ * it is already the property that ledger needs:
+ *
+ *   - Every marker is returned *bare*. The newline that carries it belongs to the caller,
+ *     which charges the marker through `measure.js` `lineCost` — marker plus that newline —
+ *     against the saving the marker advertises. Nothing in this module sizes a marker and
+ *     nothing hides one: `fold`'s fold-counts and `clip`'s ellipses are written into the
+ *     pass's own output, so their bytes are inside that pass's own delta.
+ *   - Every pass clamps at zero and `reduce` books only a positive delta, so a pass that
+ *     costs more than it removes is a no-op rather than a credit. A marker can therefore
+ *     never be booked as a saving.
+ *   - `reduce().steps` sums to `reduce().savedBytes`: each pass measures its own delta
+ *     against its own input, and the text it hands on is the text it measured. That is
+ *     what lets the reducer attribute a gross figure to each rule, and it is why the
+ *     marker text a caller appends afterwards is nowhere in either number.
  */
 
 import { formatSaving, utf8Bytes } from "./measure.js";

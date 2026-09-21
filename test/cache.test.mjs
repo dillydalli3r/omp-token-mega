@@ -1,7 +1,8 @@
 // Verifies the cache accounting of omp-token-mega: miss attribution (including
-// lifecycle-named causes), configuration resolution and its effects, agent-directory
-// resolution, subagent shard aggregation, shard retention, the config doctor's
-// transaction, and the merged command surface.
+// lifecycle-named causes and the prefix floor), per-provider pricing of a hit, the
+// capability gate that decides whether a model is accounted for at all, configuration
+// resolution and its effects, agent-directory resolution, subagent shard aggregation,
+// shard retention, the config doctor's transaction, and the merged command surface.
 //
 //   node test/cache.test.mjs
 import { mkdtemp, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
@@ -21,7 +22,14 @@ const expect = (label, cond, extra) => {
 	if (!cond) fail.push(label);
 };
 
-import { DEEPSEEK_MODEL as MODEL, SCHEDULED_MODEL as MODEL_SCHEDULED } from "./harness.mjs";
+import {
+	DEEPSEEK_MODEL as MODEL,
+	GEMINI_MODEL,
+	OPENCODE_MODEL,
+	SCHEDULED_MODEL as MODEL_SCHEDULED,
+	UNCACHED_MODEL,
+	UNPRICED_MODEL,
+} from "./harness.mjs";
 
 const readJson = async (path) => JSON.parse(await readFile(path, "utf8"));
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -104,7 +112,120 @@ const TOOLS_A = [{ function: { name: "bash" } }, { function: { name: "read" } }]
 	expect("cold start attributed to first_turn", shard.misses.byReason.first_turn === 1, shard.misses.byReason);
 	expect("tool change attributed", shard.misses.byReason.tool_change === 1, shard.misses.byReason);
 	expect("stable turns not blamed", (shard.misses.byReason.external_miss ?? 0) === 0, shard.misses.byReason);
-	expect("status row shows hit rate and savings", /DS cache \d+%/.test(h.row ?? ""));
+	expect("status row shows hit rate and savings", /cache \d+%/.test(h.row ?? ""));
+}
+
+// ---------------------------------------------------------------- per-provider pricing
+{
+	// One harness per provider, the same 120k cached tokens: the money has to come out of the
+	// live model's own registered spread, or the accounting is DeepSeek's arithmetic wearing
+	// another catalogue's rates.
+	const session = async (model, cachedTokens) => {
+		const h = await makeHarness({ model });
+		await h.fire("before_agent_start", { systemPrompt: ["you are omp"] });
+		await h.request([1, 2], TOOLS_A);
+		await h.response({ input: 10_000, output: 100, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } });
+		await h.request([1, 2, 3], TOOLS_A);
+		await h.response({ input: 0, output: 100, cacheRead: cachedTokens, cacheWrite: 0, cost: { total: 0 } });
+		const row = h.row ?? "";
+		await h.command().handler("cache", h.ctx);
+		const section = h.messages.at(-1)?.content ?? "";
+		await h.fire("session_shutdown", {});
+		const [shard] = await Promise.all((await h.shardFiles()).map((name) => readJson(join(h.shardsDir, name))));
+		return { row, section, shard };
+	};
+	const CACHED = 120_000;
+
+	const opencode = await session(OPENCODE_MODEL, CACHED);
+	const opencodeSpread = CACHED * ((0.15 - 0.003) / 1_000_000);
+	expect(
+		"an opencode-go session records the request and writes its shard",
+		opencode.shard?.totals.requests === 2 && opencode.shard.totals.hitRequests === 1 && opencode.shard.totals.cachedInputTokens === CACHED,
+		opencode.shard?.totals,
+	);
+	expect(
+		"the row prices the hit with opencode-go's own spread",
+		opencode.row.includes("cache 92%") && opencode.row.includes(`$${opencodeSpread.toFixed(2)} saved`),
+		opencode.row,
+	);
+	expect("the shard's saving is that spread over the cached tokens", Math.abs(opencode.shard.totals.savedUsd - opencodeSpread) < 1e-12, opencode.shard.totals.savedUsd);
+	expect("the section keeps the same figure to six places", opencode.section.includes(`- Saved by cache reads: $${opencodeSpread.toFixed(6)}`), opencode.section);
+
+	const gemini = await session(GEMINI_MODEL, CACHED);
+	const geminiSpread = CACHED * ((1.5 - 0.15) / 1_000_000);
+	expect(
+		"a Gemini session is priced by Gemini's own rates, not DeepSeek's on another id",
+		gemini.row.includes("cache 92%") &&
+			gemini.row.includes(`$${geminiSpread.toFixed(2)} saved`) &&
+			Math.abs(gemini.shard.totals.savedUsd - geminiSpread) < 1e-12 &&
+			Math.abs(gemini.shard.totals.savedUsd - opencode.shard.totals.savedUsd) > 0.1,
+		{ row: gemini.row, gemini: gemini.shard.totals.savedUsd, opencode: opencode.shard.totals.savedUsd },
+	);
+}
+
+// ---------------------------------------------------------------- capability gate
+{
+	// A model whose provider neither declares a cache-read rate nor reports cached tokens:
+	// nothing is fingerprinted, nothing is persisted, and the section says why in words rather
+	// than printing a 0% hit rate that reads as a broken cache.
+	const h = await makeHarness({ model: UNCACHED_MODEL });
+	await h.fire("before_agent_start", { systemPrompt: ["you are omp"] });
+	await h.request([1, 2], TOOLS_A);
+	await h.response({ input: 10_000, output: 100, cacheRead: 9_000, cacheWrite: 0, cost: { total: 0.001 } });
+	expect("the row carries no cache figure for it", !/cache/.test(h.row ?? ""), h.row);
+	await h.command().handler("cache", h.ctx);
+	const section = h.messages.at(-1)?.content ?? "";
+	expect(
+		"the section explains the absence instead of reporting a 0% hit rate",
+		section.includes("declares no cache-read rate") &&
+			section.includes("not one known to report cached input tokens") &&
+			!section.includes("- Requests:") &&
+			!/hit rate: \d/.test(section),
+		section,
+	);
+	await h.fire("session_shutdown", {});
+	// Read after the report and the shutdown that follows it, not before: reading a report is
+	// where this gate used to leak a store, and a store only reaches disk when it flushes — at
+	// shutdown, or on its own debounce. A reading taken before the report cannot see the store
+	// the report itself created.
+	expect(
+		"a model that reports no cached tokens records no request and writes no shard, even once its report has been read",
+		(await h.shardFiles()).length === 0,
+		await h.shardFiles(),
+	);
+
+	// The half of that gate where a rate is missing but the provider does report cached
+	// tokens: the hit rate and the token counts stand, and only the money is admitted unknown.
+	// A `$0.000000` there would read as a cache that saves nothing rather than one that
+	// cannot be priced.
+	const unpriced = await makeHarness({ model: UNPRICED_MODEL });
+	await unpriced.fire("before_agent_start", { systemPrompt: ["you are omp"] });
+	await unpriced.request([1, 2], TOOLS_A);
+	await unpriced.response({ input: 10_000, output: 100, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } });
+	await unpriced.request([1, 2, 3], TOOLS_A);
+	await unpriced.response({ input: 0, output: 100, cacheRead: 120_000, cacheWrite: 0, cost: { total: 0 } });
+	const row = unpriced.row ?? "";
+	expect("an unpriced model still reports its hit rate and cached tokens", /cache 92%/.test(row) && row.includes("120k cached"), row);
+	expect("and claims no saving it cannot price", !/\$[\d.]+ saved/.test(row), row);
+	await unpriced.command().handler("cache", unpriced.ctx);
+	const unpricedSection = unpriced.messages.at(-1)?.content ?? "";
+	expect(
+		"the section says the saving is unknown rather than $0.000000",
+		unpricedSection.includes("- Saved by cache reads: unknown") && !unpricedSection.includes("Saved by cache reads: $"),
+		unpricedSection,
+	);
+	expect(
+		"while the figures it did measure are still printed",
+		unpricedSection.includes("- Cached input tokens: 120,000") && unpricedSection.includes("- Token-weighted hit rate: 92.3%"),
+		unpricedSection,
+	);
+	await unpriced.fire("session_shutdown", {});
+	const [shard] = await Promise.all((await unpriced.shardFiles()).map((name) => readJson(join(unpriced.shardsDir, name))));
+	expect(
+		"the shard records the hit with no money attached",
+		shard.totals.hitRequests === 1 && shard.totals.cachedInputTokens === 120_000 && shard.totals.savedUsd === 0,
+		shard.totals,
+	);
 }
 
 // ---------------------------------------------------------------- lifecycle causes
@@ -181,6 +302,55 @@ const TOOLS_A = [{ function: { name: "bash" } }, { function: { name: "read" } }]
 	expect("idle_ttl honours the configured TTL", shard.misses.byReason.idle_ttl === 1, shard.misses.byReason);
 }
 
+// ---------------------------------------------------------------- prefix floor
+{
+	// A prefix under the provider's minimum cacheable unit cannot be cached by anyone: the
+	// floor labels that miss instead of leaving it to read as an unexplained provider fault.
+	const FLOOR = 1024;
+	const under = FLOOR - 724;
+	const h = await makeHarness({ settings: { "@dillydalli3r/omp-token-mega": { "cache.minPrefixTokens": FLOOR } } });
+	await h.fire("before_agent_start", { systemPrompt: ["you are omp"] });
+
+	await h.request([1, 2], TOOLS_A);
+	await h.response({ input: 10_000, output: 10, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } });
+
+	// Same prompt and same catalogue, a prefix under the floor: the one miss no amount of
+	// client-side work can fix.
+	await h.request([1, 2, 3], TOOLS_A);
+	await h.response({ input: under, output: 10, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } });
+
+	// The same short prefix with the catalogue changed: the change is still the cause, so the
+	// floor must not swallow it.
+	await h.request([1, 2, 3, 4], [{ function: { name: "read" } }]);
+	await h.response({ input: under, output: 10, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } });
+
+	await h.command().handler("cache", h.ctx);
+	const section = h.messages.at(-1)?.content ?? "";
+	expect("the section lists the floor as a named cause", /\n- prefix_too_small: 1\n|\n- prefix_too_small: 1$/.test(section), section.slice(-260));
+
+	await h.fire("session_shutdown", {});
+	const [shard] = await Promise.all((await h.shardFiles()).map((name) => readJson(join(h.shardsDir, name))));
+	expect("a prefix below the floor is named as such", shard.misses.byReason.prefix_too_small === 1, shard.misses.byReason);
+	expect("a changed catalogue still outranks the floor", shard.misses.byReason.tool_change === 1, shard.misses.byReason);
+	expect("and the floor does not fall through to the catch-all", (shard.misses.byReason.external_miss ?? 0) === 0, shard.misses.byReason);
+
+	// A floor of 0 is the setting's own "no floor": the same request then reads as a
+	// provider-side miss, which is what an unlabelled miss has to mean.
+	const off = await makeHarness({ settings: { "@dillydalli3r/omp-token-mega": { "cache.minPrefixTokens": 0 } } });
+	await off.fire("before_agent_start", { systemPrompt: ["you are omp"] });
+	await off.request([1, 2], TOOLS_A);
+	await off.response({ input: 10_000, output: 10, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } });
+	await off.request([1, 2, 3], TOOLS_A);
+	await off.response({ input: under, output: 10, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } });
+	await off.fire("session_shutdown", {});
+	const [offShard] = await Promise.all((await off.shardFiles()).map((name) => readJson(join(off.shardsDir, name))));
+	expect(
+		"a floor of 0 leaves the same miss to the provider",
+		offShard.misses.byReason.external_miss === 1 && (offShard.misses.byReason.prefix_too_small ?? 0) === 0,
+		offShard.misses.byReason,
+	);
+}
+
 // ---------------------------------------------------------------- real-time pricing
 {
 	const peak = Date.UTC(2026, 8, 16, 2, 0, 0); // Wednesday 02:00 UTC — inside a peak window
@@ -228,6 +398,84 @@ const TOOLS_A = [{ function: { name: "bash" } }, { function: { name: "read" } }]
 		label(weekend),
 	);
 	expect("off-peak detail names the weekday of the UTC window", label(weekend)?.detail === "peak Mon 01:00\u201304:00Z = 2026-09-20 21:00\u20132026-09-21 00:00 EDT", label(weekend));
+
+	// Weekends are off-peak because the declared windows are Mon\u2013Fri, not because the code
+	// knows what a weekend is: the same minute that is peak on Friday is off-peak on Saturday,
+	// and its label waits for Monday morning. The reverse reading \u2014 a card that declares every
+	// day, as a promotional week can \u2014 prices the weekend peak.
+	const saturday = Date.UTC(2026, 8, 19, 2, 0, 0); // Saturday 02:00 UTC \u2014 a weekday peak minute, on a weekend
+	expect("saturday fixture is a Saturday", new Date(saturday).getUTCDay() === 6, new Date(saturday).toISOString());
+	expect("a weekend minute inside a window is off-peak, not peak", pricePeriod(MODEL_SCHEDULED, saturday) === "off-peak" && label(saturday)?.text === "off-peak, peak 2026-09-20 21:00\u20132026-09-21 00:00 EDT", label(saturday));
+	// The window is inert at the same minute on a day its `weekdays` excludes: the declaration
+	// is which days peak, so a Saturday must not inherit Friday's occurrence, and its label
+	// must not claim peak is on.
+	expect(
+		"the same minute is off-peak on a day the window excludes",
+		pricePeriod(MODEL_SCHEDULED, saturday) === "off-peak" && label(saturday)?.period === "off-peak" && !label(saturday)?.text.startsWith("peak "),
+		label(saturday),
+	);
+	const sevenDays = {
+		...MODEL_SCHEDULED,
+		cost: { ...MODEL_SCHEDULED.cost, timeBased: { offPeakMultiplier: 0.5, peakWindows: MODEL_SCHEDULED.cost.timeBased.peakWindows.map((window) => ({ ...window, weekdays: [0, 1, 2, 3, 4, 5, 6] })) } },
+	};
+	expect("a card that peaks daily prices the weekend peak", pricePeriod(sevenDays, saturday) === "peak" && priceMultiplier(sevenDays, saturday) === 1, pricePeriod(sevenDays, saturday));
+
+	// Every minute of two UTC weeks must classify exactly as the declared rule reads, since
+	// that is the rule the provider bills by \u2014 an off-by-one at a window edge would put the
+	// wrong card on a real request.
+	{
+		const windows = MODEL_SCHEDULED.cost.timeBased.peakWindows;
+		const declared = (at) => {
+			const day = Math.floor(at / 86_400_000);
+			const weekday = (((day + 4) % 7) + 7) % 7;
+			const minute = Math.floor((at - day * 86_400_000) / 60_000);
+			return windows.some((window) => window.weekdays.includes(weekday) && minute >= window.startMinute && minute < window.endMinute) ? "peak" : "off-peak";
+		};
+		const start = Date.UTC(2026, 8, 14, 0, 0, 0);
+		let checked = 0;
+		let wrong;
+		for (let at = start; at < start + 14 * 86_400_000; at += 60_000) {
+			checked += 1;
+			if (pricePeriod(MODEL_SCHEDULED, at) !== declared(at)) {
+				wrong = new Date(at).toISOString();
+				break;
+			}
+		}
+		expect("two UTC weeks of minutes classify exactly as declared", wrong === undefined, { wrong, checked });
+	}
+
+	// A window whose end is not after its start crosses UTC midnight. The occurrence is still
+	// in force after 00:00 \u2014 the minute that matters is the one on the day it opened \u2014 and
+	// the label dates it there; a day-only predicate misses this case.
+	const crossing = {
+		...MODEL_SCHEDULED,
+		cost: { ...MODEL_SCHEDULED.cost, timeBased: { offPeakMultiplier: 0.5, peakWindows: [{ weekdays: [1], startMinute: 1_380, endMinute: 120 }] } },
+	}; // Monday 23:00 \u2192 Tuesday 02:00 UTC
+	const beforeMidnight = Date.UTC(2026, 8, 21, 23, 30, 0);
+	const afterMidnight = Date.UTC(2026, 8, 22, 0, 30, 0);
+	const pastWindow = Date.UTC(2026, 8, 22, 1, 30, 0);
+	expect(
+		"crossing fixtures bracket Monday night UTC",
+		new Date(beforeMidnight).getUTCDay() === 1 && new Date(afterMidnight).getUTCDay() === 2 && new Date(pastWindow).getUTCDay() === 2,
+		[beforeMidnight, afterMidnight, pastWindow].map((at) => new Date(at).toISOString()),
+	);
+	expect("a crossing window is peak on the day it opened", pricePeriod(crossing, beforeMidnight) === "peak" && priceMultiplier(crossing, beforeMidnight) === 1);
+	expect("and peak after midnight, on the next UTC day", pricePeriod(crossing, afterMidnight) === "peak" && priceMultiplier(crossing, afterMidnight) === 1);
+	expect("and still peak just before its end", pricePeriod(crossing, pastWindow) === "peak");
+	// The occurrence in force after midnight opens and closes on the clock's own UTC day, so
+	// its local span is this evening's, not yesterday's — a label dated a day late would send
+	// the user to the wrong night.
+	expect(
+		"a crossing window reports off-peak past its end, with the next occurrence dated",
+		pricePeriod(crossing, Date.UTC(2026, 8, 22, 2, 0, 0)) === "off-peak" &&
+			peakLabel(crossing, Date.UTC(2026, 8, 22, 2, 0, 0), ZONE)?.text === "off-peak, peak 2026-09-28 19:00\u20132026-09-28 22:00 EDT",
+		peakLabel(crossing, Date.UTC(2026, 8, 22, 2, 0, 0), ZONE),
+	);
+	expect(
+		"the cross-midnight label names the occurrence's own span",
+		peakLabel(crossing, afterMidnight, ZONE)?.detail === "23:00\u201302:00Z = 2026-09-22 19:00\u20132026-09-22 22:00 EDT",
+		peakLabel(crossing, afterMidnight, ZONE),
+	);
 
 	// The same UTC window, read in January: the zone changed offset, so the times and the
 	// zone name must change with it. A label that hard-coded EST would be an hour wrong all
@@ -335,7 +583,7 @@ const TOOLS_A = [{ function: { name: "bash" } }, { function: { name: "read" } }]
 	expect("status row reports the session-wide saving rounded to hundredths", row.includes("$0.01 saved"), row);
 	expect("status row cached tokens cover the whole session", row.includes("120k cached"), row);
 	// Main alone is 19,700 / 29,700 = 66%; the child lifts the session figure to 92%.
-	expect("status row hit rate is the session figure", /DS cache 92%/.test(row), row);
+	expect("status row hit rate is the session figure", /cache 92%/.test(row), row);
 
 	await h.command().handler("report", h.ctx);
 	const report = h.messages.at(-1)?.content ?? "";
@@ -760,11 +1008,11 @@ expect("child session resolves the same agent dir", resolveAgentDir(childCtx) ==
 	const command = h.command();
 
 	await command.handler("status", h.ctx);
-	expect("status subcommand notifies", /DS cache/.test(h.notices.at(-1) ?? ""), h.notices.at(-1));
+	expect("status subcommand notifies", /cache/.test(h.notices.at(-1) ?? ""), h.notices.at(-1));
 
 	await command.handler("report", h.ctx);
 	const report = h.messages.at(-1)?.content ?? "";
-	expect("report rendered", report.includes("### DeepSeek prefix cache"), report.slice(0, 80));
+	expect("report rendered", report.includes("### Prefix cache"), report.slice(0, 80));
 	expect("report has a breakdown section", report.includes("#### Breakdown"));
 	expect("report lists miss causes", report.includes("Misses by attributed cause"));
 	expect("report includes fingerprints", report.includes("Tool catalogue:"));

@@ -4,6 +4,13 @@
  * Endpoint: GET https://api.deepseek.com/user/balance
  * Docs:     https://api-docs.deepseek.com/api/get-user-balance
  *
+ * DeepSeek-scoped on purpose. The balance feature speaks for every cache-capable provider,
+ * but DeepSeek is the only one whose account endpoint this plugin reads: every other
+ * provider is reported there from the session's own usage, with no balance figure at all.
+ * So nothing in this module is provider-agnostic, and it is only ever reached from a
+ * DeepSeek model — the credential and base URL are resolved the way the model request path
+ * resolves them, so the call reads the same account the session is billing.
+ *
  * The response amounts are strings, not numbers, and the payload is untrusted
  * network input, so everything is parsed tolerantly and never throws into a
  * caller's event handler.

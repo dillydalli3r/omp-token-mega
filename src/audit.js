@@ -21,6 +21,7 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { formatBytes, formatTokens, percent, tokensFromBytes, utf8Bytes } from "./measure.js";
+import { appendOnlyAutoEnabled, cacheCapable } from "./model.js";
 
 /**
  * omp 18.x schema defaults for the keys this audit reasons about, used only when the
@@ -29,6 +30,11 @@ import { formatBytes, formatTokens, percent, tokensFromBytes, utf8Bytes } from "
  * believes it read next to the one it recommends, and `/mega audit` shows both.
  */
 export const CORE_DEFAULTS = {
+	// The one key here that is not a token lever but a prefix-stability lever: omp only
+	// auto-enables append-only context for DeepSeek, the local engines, routes served over
+	// loopback or the local network, and store-backed routes, so elsewhere the setting is
+	// whatever the user stored — and until one is stored, no settings file carries it.
+	"provider.appendOnlyContext": "auto",
 	"tools.artifactSpillThreshold": 50,
 	"tools.artifactTailBytes": 20,
 	"tools.artifactHeadBytes": 20,
@@ -45,6 +51,14 @@ export const CORE_DEFAULTS = {
 	"read.summarize.enabled": true,
 	"read.summarize.prose": false,
 };
+
+/**
+ * Gemini's implicit cache floor: the provider only caches a prefix above a model-specific
+ * minimum, 1024 tokens on the 2.5 and later tiers. Below it a request is billed fully
+ * uncached, so a short envelope's miss is the provider's floor — not a regression in the
+ * setup, and not something a client-side setting can change.
+ */
+const GOOGLE_CACHE_FLOOR = 1024;
 
 function scalar(raw) {
 	const text = raw.trim();
@@ -236,9 +250,43 @@ export function recommendedSpillThreshold(contextWindow) {
 	return Math.min(50, Math.max(8, Math.round(contextWindow / 8000)));
 }
 
-export function recommendations({ core, usage, catalog, config }) {
+/**
+ * Advice rows in the shape `formatAudit` renders: `{ key, current, recommended, why, command }`.
+ * `model` is the live model and is optional — the two rows that depend on the provider (omp's
+ * append-only context, Gemini's cache floor) simply never fire without it, which is what keeps
+ * an audit with no model loaded honest.
+ */
+export function recommendations({ core, usage, catalog, config, model }) {
 	const rows = [];
 	const window = usage?.contextWindow ?? 0;
+
+	// The largest cache win this plugin can name, and the only one it cannot apply itself:
+	// omp's auto rule covers DeepSeek, the local engines, routes served over loopback or the
+	// local network, and store-backed routes; on every other provider a prefix cache can read
+	// the per-turn re-serialization of the system prompt and tool catalogue as a change. The
+	// row reports the setting and the command; the plugin never writes omp's settings.
+	if (model && cacheCapable(model) && core.values["provider.appendOnlyContext"] !== "on" && !appendOnlyAutoEnabled(model)) {
+		rows.push({
+			key: "provider.appendOnlyContext",
+			current: String(core.values["provider.appendOnlyContext"] ?? "auto"),
+			recommended: "on",
+			why: "omp turns append-only context on by itself only for DeepSeek, the local engines, routes served over loopback or the local network, and store-backed routes — this provider is none of those, so the live system prompt and tool catalogue are re-serialized each turn, which a provider prefix cache can read as a change; append-only freezes the prefix once and appends, which is what makes the cache hit. This row is the plugin reporting the setting, never a write.",
+			command: command("provider.appendOnlyContext", "on"),
+		});
+	}
+
+	// The one miss worth naming instead of chasing: Gemini's implicit cache only applies
+	// above a model-specific minimum, so a short envelope is billed fully uncached and no
+	// client-side change turns it into a hit. No command, because there is nothing to set.
+	if (String(model?.provider ?? "").startsWith("google") && Number(usage?.tokens) > 0 && Number(usage?.tokens) < GOOGLE_CACHE_FLOOR) {
+		rows.push({
+			key: "gemini implicit cache",
+			current: `${usage.tokens} tokens in context`,
+			recommended: "no change",
+			why: `Gemini's implicit cache only applies above a model-specific minimum (${GOOGLE_CACHE_FLOOR} tokens on the 2.5+ tiers), so below it every request is billed fully uncached and no client-side change can turn it into a hit — the miss is the provider's floor, not a regression in the setup.`,
+			command: undefined,
+		});
+	}
 
 	const spill = Number(core.values["tools.artifactSpillThreshold"]);
 	const target = recommendedSpillThreshold(window);
@@ -320,7 +368,7 @@ export function recommendations({ core, usage, catalog, config }) {
 }
 
 /** The audit document. Everything numeric states its source; estimates say so. */
-export function formatAudit({ config, core, usage, prompt, catalog, stats, perf }) {
+export function formatAudit({ config, core, usage, prompt, catalog, stats, perf, model }) {
 	const lines = ["### Token audit", ""];
 
 	lines.push("**This request envelope**", "");
@@ -358,7 +406,7 @@ export function formatAudit({ config, core, usage, prompt, catalog, stats, perf 
 		}
 	}
 
-	const advice = recommendations({ core, usage, catalog, config });
+	const advice = recommendations({ core, usage, catalog, config, model });
 	lines.push("", "**Recommendations**", "");
 	if (advice.length === 0) lines.push("- Nothing outstanding: the levers this audit checks are already set for this model.");
 	for (const row of advice) {

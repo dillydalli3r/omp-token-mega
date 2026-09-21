@@ -1,22 +1,24 @@
 /**
  * DeepSeek detection, usage normalization, and cache economics.
  *
- * Everything in this plugin is scoped to the DeepSeek provider. DeepSeek bills a
- * cache hit at a small fraction of the uncached input rate (deepseek-flash peaks at
- * $0.30/Mtok uncached vs $0.006/Mtok cached), which is what makes a hit worth
- * measuring at all.
+ * Only two things here are DeepSeek's own: the provider predicate, and the peak/off-peak
+ * tariff DeepSeek's rate card declares. The rest is generic arithmetic over fields omp
+ * normalizes for every provider — `usage.input` / `usage.cacheRead` / `usage.cacheWrite` /
+ * `usage.cost` for the accounting, `model.cost` for the rates — and nothing here reads the
+ * provider id, which is what lets one cache feature price a DeepSeek, opencode-go, Gemini or
+ * LithosAI session with the same functions.
+ *
+ * The tariff is why pricing a hit is worth the trouble at all: DeepSeek bills a cached token
+ * at a small fraction of the uncached input rate (deepseek-flash peaks at $0.30/Mtok uncached
+ * vs $0.006/Mtok cached) and halves both off peak. A model that declares no schedule gets no
+ * multiplier and no label, so the arithmetic there degrades to the plain input-minus-cacheRead
+ * difference — which is all a flat cache discount has to say.
  */
-
-import { activeModel, modelKey } from "./model.js";
 
 export const DEEPSEEK_PROVIDER = "deepseek";
 
 export function isDeepSeekModel(model) {
 	return model?.provider === DEEPSEEK_PROVIDER;
-}
-
-export function isDeepSeek(ctx) {
-	return isDeepSeekModel(activeModel(ctx));
 }
 
 const num = (value) => {
@@ -25,11 +27,11 @@ const num = (value) => {
 };
 
 /**
- * Token accounting for one response.
- *
- * omp already folds DeepSeek's `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`
- * into the normalized usage record: `input` is the uncached remainder, `cacheRead` the
- * hit, and `cacheWrite` is forced to 0 because DeepSeek charges no cache-write fee.
+ * Token accounting for one response, in the shape omp normalizes for every provider. For
+ * DeepSeek it has already folded `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens` in:
+ * `input` is the uncached remainder, `cacheRead` the hit, and `cacheWrite` is forced to 0
+ * because DeepSeek charges no cache-write fee. `hitRate` is taken over `billedInput`, so a
+ * provider that does bill cache writes still gets one rate rather than two.
  */
 export function cacheStats(usage) {
 	const input = num(usage?.input);
@@ -63,9 +65,14 @@ const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
  *
  * Mirrors omp's own `timeBasedMultiplier` (pi-catalog `models.ts`): UTC-only integer
  * arithmetic, `weekday` counted from the Unix epoch's Thursday, `minute` since UTC
- * midnight, half-open windows `[startMinute, endMinute)`. Scheduled rate cards
- * (`timeBased.effectiveRates`) and long-context tiers are not modelled — no DeepSeek
- * model declares either, and every DeepSeek model does declare the peak schedule.
+ * midnight, half-open windows `[startMinute, endMinute)`. Two deliberate differences:
+ * a window whose end is not after its start is detected after UTC midnight too, where
+ * omp's day-only predicate misses it; and the label says nothing about weekends, which
+ * DeepSeek prices off-peak only by virtue of the `weekdays` its rates declare — a future
+ * seven-day card prices them peak with no change here. Uncertain days no declaration
+ * covers (DeepSeek's Chinese public holidays) are priced peak, as omp prices them.
+ * Scheduled rate cards (`timeBased.effectiveRates`) and long-context tiers are not
+ * modelled.
  */
 function peakClock(model, at) {
 	const schedule = model?.cost?.timeBased;
@@ -89,10 +96,33 @@ function discountMultiplier(schedule) {
 	return multiplier > 0 && multiplier !== 1 ? multiplier : undefined;
 }
 
-/** The half-open window `[startMinute, endMinute)` the clock sits in, or `undefined`. */
-function windowAt({ schedule, weekday, minute }) {
-	for (const window of schedule.peakWindows) {
-		if (minute >= window.startMinute && minute < window.endMinute && window.weekdays?.includes(weekday)) return window;
+/**
+ * Whether the window is in force at the clock's instant, resolving the two occurrences that
+ * can be: the one opened on the clock's UTC day, and — only for a window whose end is not
+ * after its start (23:00→01:00) — the one opened the day before. `dayOffset` is returned so
+ * the caller can date the occurrence it matched.
+ */
+function windowInForce(clock, window) {
+	const crossing = window.endMinute <= window.startMinute;
+	const today = clock.weekday;
+	const yesterday = (((clock.weekday - 1) % 7) + 7) % 7;
+	if (window.weekdays?.includes(today) && (crossing ? clock.minute >= window.startMinute || clock.minute < window.endMinute : clock.minute >= window.startMinute && clock.minute < window.endMinute)) {
+		return { window, dayOffset: 0 };
+	}
+	if (crossing && window.weekdays?.includes(yesterday) && clock.minute < window.endMinute) {
+		// After midnight, still inside an occurrence that opened on the previous UTC day and
+		// crossed into this one. Its occurrence is dated to the clock's own day — the window's
+		// end minute is small, so `windowSpan` resolves the end forward into this day.
+		return { window, dayOffset: 0 };
+	}
+	return undefined;
+}
+
+/** The window in force at the clock, with the day its occurrence opened on, or `undefined`. */
+function windowAt(clock) {
+	for (const window of clock.schedule.peakWindows) {
+		const match = windowInForce(clock, window);
+		if (match) return match;
 	}
 	return undefined;
 }
@@ -221,13 +251,13 @@ export function peakLabel(model, at = Date.now(), timeZone) {
 	if (!clock || discountMultiplier(clock.schedule) === undefined) return undefined;
 	const open = windowAt(clock);
 	if (open) {
-		// `windowAt` matched the current minute against `[start, end)` on the clock's own UTC
-		// day (the rule omp prices by), so the occurrence in force opened earlier today.
-		const span = windowSpan(clock, open, 0);
+		// The occurrence in force opened on the day `windowAt` resolved against — the clock's
+		// own UTC day, or the previous one for a window that crosses UTC midnight.
+		const span = windowSpan(clock, open.window, open.dayOffset);
 		return {
 			period: "peak",
 			text: `peak ${localRange(span, timeZone)}`,
-			detail: `${windowRange(open)} = ${localRange(span, timeZone)}`,
+			detail: `${windowRange(open.window)} = ${localRange(span, timeZone)}`,
 		};
 	}
 	const next = nextWindow(clock);

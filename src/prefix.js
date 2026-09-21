@@ -1,21 +1,36 @@
 /**
  * Prefix identity and cache-miss attribution.
  *
- * DeepSeek's cache is an automatic, disk-backed prefix KV cache: a request hits only
- * when its leading tokens match a previously persisted cache unit byte for byte, and
- * matching is all-or-nothing per unit rather than a longest-common-prefix scan. So the
- * only thing worth tracking is *what changed in the prefix*, which is what this module
- * fingerprints and names.
+ * A provider's prefix cache — DeepSeek's persisted KV units, Gemini's implicit cache,
+ * Anthropic's and OpenAI's prompt caches — is automatic: a request hits only when its
+ * leading tokens match a prefix the provider cached earlier, and the tail cannot be
+ * half-cached. So the only thing worth tracking is *what changed in the prefix*, which is
+ * what this module fingerprints and names.
  *
- * omp already protects the prefix for DeepSeek (`provider.appendOnlyContext` is enabled
- * automatically when `model.provider === "deepseek"`, keeping the system prompt, tool
- * catalogue and message log byte-stable). This module deliberately does NOT rewrite the
- * prefix — it observes it, so a regression elsewhere can be named instead of guessed at.
+ * omp can hold that prefix still — `provider.appendOnlyContext` keeps the system prompt,
+ * tool catalogue and message log unchanged from turn to turn — but it only turns that mode
+ * on by itself for DeepSeek, the local engines and store-backed routes. On every other
+ * provider (opencode-go, google, anthropic, openai) the prefix is only as stable as omp's
+ * normal serialization, so a needless re-serialization there costs the whole prefix's hits
+ * on each affected turn. This module deliberately does NOT rewrite the prefix — it observes
+ * it, so a change that costs hits is named instead of guessed at.
  */
 
 import { createHash } from "node:crypto";
 
-/** Reason enum for a lost cache. Ordered by how actionable each cause is. */
+/**
+ * Reason enum for a lost cache, ordered by how actionable the cause is: what the client or
+ * the session changed in the prefix first (`first_turn` through `model_switch`), then the two
+ * session-level causes, then the causes only the host produces (`branch_nav`, `resume`) and
+ * the catch-all (`external_miss`).
+ *
+ * The two session-level entries are split by what a user can do about them. An idle eviction
+ * (`idle_ttl`) is the miss the user prevents by working sooner, so it is named first. A prefix
+ * under the provider's minimum cacheable unit (`prefix_too_small`) is the one miss no amount
+ * of client-side work can fix, so it is labelled rather than chased and sits behind everything
+ * the client can be asked to change. `branch_nav` and `resume` trail the named causes because
+ * they are deliberate acts, not a prefix nobody held onto.
+ */
 export const MISS_REASONS = [
 	"first_turn",
 	"system_change",
@@ -24,6 +39,7 @@ export const MISS_REASONS = [
 	"compaction",
 	"model_switch",
 	"idle_ttl",
+	"prefix_too_small",
 	"branch_nav",
 	"resume",
 	"external_miss",
@@ -78,14 +94,25 @@ export function toolDiff(previous, next) {
  * session; `next` the one observed now. Returns `undefined` when nothing about the
  * prefix changed, in which case a miss is provider-side and reported as
  * `external_miss` rather than blamed on the client.
+ *
+ * Causes are tested most-specific-first, and a client-side change outranks the idle gap: when
+ * the system prompt changed *and* the session sat idle past the TTL, the change is the one the
+ * user can act on now.
+ *
+ * `billedInput` is what the request billed as prompt tokens (uncached + read + written) and
+ * `minPrefixTokens` the configured `cache.minPrefixTokens` floor. Below most providers' minimum
+ * cacheable unit an absent cache is inherent rather than a defect, so that miss is *labelled*
+ * by the floor instead of chased — but the label is opt-in: with a floor of 0 (the default, and
+ * what a caller that passes neither option gets) `prefix_too_small` can never be returned.
  */
-export function attributeMiss(previous, next, { idleMs = 0, requests = 0, idleTtlMs = IDLE_TTL_MS } = {}) {
+export function attributeMiss(previous, next, { idleMs = 0, requests = 0, idleTtlMs = IDLE_TTL_MS, billedInput = 0, minPrefixTokens = 0 } = {}) {
 	if (!previous || requests === 0) return "first_turn";
 	if (previous.modelKey !== next.modelKey) return "model_switch";
 	if (previous.system !== next.system) return "system_change";
 	if (previous.tools?.id !== next.tools?.id) return "tool_change";
 	if (next.messageCount < previous.messageCount) return "history_rewrite";
 	if (idleMs > idleTtlMs) return "idle_ttl";
+	if (minPrefixTokens > 0 && billedInput > 0 && billedInput < minPrefixTokens) return "prefix_too_small";
 	return "external_miss";
 }
 

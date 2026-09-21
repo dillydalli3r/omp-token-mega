@@ -62,10 +62,10 @@ function toParts(segment) {
 /**
  * Compose the row from the per-feature segments.
  *
- * `segments` maps a group name (`cache`, `balance`, `token`) to its already-rendered text —
- * or to several parts, when one token inside the segment carries a tone — and to
- * `undefined`/`""` when that feature has nothing to say right now: a non-DeepSeek model, a
- * disabled feature, no requests yet.
+ * `segments` maps a group name (`cache`, `balance`, `token`) to its already-rendered
+ * text — or to several parts, when one token inside the segment carries a tone — and to
+ * `undefined`/`""` when that feature has nothing to say right now: a model it does not meter,
+ * a disabled feature, no requests yet.
  *
  * Returns rows of parts rather than a string: tinting needs a theme, and the theme only
  * exists inside the TUI component that calls `renderRow`. A trailing segment that would

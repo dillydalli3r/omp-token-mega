@@ -31,24 +31,62 @@ export function hashText(text) {
 	return createHash("sha256").update(text, "utf8").digest("hex").slice(0, 32);
 }
 
-export function createDuplicateIndex({ minChars = DEDUPE_MIN_CHARS } = {}) {
+/**
+ * `enabled` is the master switch, and it is a predicate rather than a boolean because the
+ * index is built at install time — before the configuration is loaded — so a boolean
+ * captured here would be fixed for the life of the session, while `token.dedupe` is editable
+ * mid-session. It is asked at every entry point instead of at the call sites because every
+ * path in this file that hashes is behind this one line: a caller that forgets to test the
+ * switch cannot re-introduce the hash the switch exists to skip. Absent, it defaults to on,
+ * which is what an index built without a configuration to consult should mean.
+ */
+export function createDuplicateIndex({ minChars = DEDUPE_MIN_CHARS, enabled = () => true } = {}) {
 	/** Insertion-ordered, so the oldest key is the first one the iterator yields. */
 	const seen = new Map();
+	/** The floor this index was built with, for callers that have no setting to pass. */
+	const defaultFloor = minChars;
+	const isEnabled = enabled;
 
 	return {
-		/** Content too small to be worth a back-reference, or too cheap to hash. */
-		skips(text) {
-			return text.length < minChars || text.trim() === "";
+		/**
+		 * Content too small to be worth a back-reference, or too cheap to hash. A numeric
+		 * `minChars` overrides the floor this index was constructed with, because the index
+		 * is built once at install time — before the configuration is loaded — and
+		 * `token.dedupeMinChars` is editable mid-session, so a floor captured in the
+		 * constructor is a floor the user cannot change. Taking it here puts the setting at
+		 * the decision point, where it is read afresh for every result.
+		 */
+		skips(text, minChars) {
+			const floor = typeof minChars === "number" ? minChars : defaultFloor;
+			return text.length < floor || text.trim() === "";
 		},
 
-		/** The earlier occurrence of this exact content, or undefined. Read-only. */
+		/**
+		 * The earlier occurrence of this exact content, or undefined. Read-only.
+		 *
+		 * Inert while the switch is off, and that loses nothing: the same predicate stops a
+		 * result being registered, so an index left empty by the switch cannot hold an entry
+		 * a lookup should have found. The two are one decision, taken in one place.
+		 */
 		lookup(text) {
+			if (!isEnabled()) return undefined;
 			const key = hashText(text);
 			return seen.get(key);
 		},
 
-		/** Register content that was sent in full. Re-registering refreshes recency. */
+		/**
+		 * Register content that was sent in full. Re-registering refreshes recency.
+		 *
+		 * Inert while the switch is off: this is the hot path — every in-scope result passes
+		 * through it — and hashing bytes that no lookup will ever compare is work bought for
+		 * nothing. The stretch spent off is not replayed when the switch goes back on, so a
+		 * result that arrived while it was off is not collapsed against a later repeat of the
+		 * same bytes. That is the deliberate trade: the alternative is paying the hash on every
+		 * result for the whole session to cover the case where the user turns the feature on
+		 * mid-session and immediately repeats something.
+		 */
 		remember(toolName, text, handle) {
+			if (!isEnabled()) return undefined;
 			const key = hashText(text);
 			const previous = seen.get(key);
 			if (previous) {

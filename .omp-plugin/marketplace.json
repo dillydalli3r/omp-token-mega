@@ -6,15 +6,15 @@
     "url": "https://github.com/dillydalli3r"
   },
   "metadata": {
-    "description": "One plugin for the oh-my-pi token economy: cache-safe tool-result reduction, DeepSeek prefix-cache accounting, and the DeepSeek account balance \u2014 one command, one settings menu, one status row.",
-    "version": "1.0.0",
+    "description": "One plugin for the oh-my-pi token economy: prefix-cache accounting and advice for every provider whose models report cached input tokens (DeepSeek, OpenCode, Google Gemini, LithosAI, Anthropic, OpenAI), a cache-safe tool-result reducer, and the account behind the active model. One command, one settings menu, one status row.",
+    "version": "2.0.0",
     "pluginRoot": "."
   },
   "plugins": [
     {
       "name": "omp-token-mega",
-      "description": "Merged token plugin for oh-my-pi. Reduces live tool results before they are sent (terminal escapes, identical line runs, over-long lines, pretty-printed JSON), collapses byte-identical results by content hash, elides over-budget results behind artifact:// handles, audits the request envelope with copy-paste omp config advice, accounts the DeepSeek prefix cache (hit rate, miss attribution, tool-catalogue drift, subagent shards), reports the DeepSeek account balance and session spend, and registers the LithosAI provider with its /login flow, measured tokens/second and per-minute rate-limit budgets. Every metric is drawn on ONE status row. Never rewrites history, so DeepSeek/OpenAI/Anthropic prefix caches keep their hits.",
-      "version": "1.0.0",
+      "description": "Merged token plugin for oh-my-pi. Accounts the prefix cache on every provider whose models report cached input tokens \u2014 DeepSeek, OpenCode, Google Gemini, LithosAI, Anthropic, OpenAI \u2014 with hit rate, miss attribution, tool-catalogue drift and subagent shards, and names the one omp setting that keeps the prefix byte-stable (provider.appendOnlyContext) wherever omp does not turn append-only context on by itself. Reduces live tool results before they are sent (terminal escapes, identical line runs, over-long lines, pretty-printed JSON), collapses byte-identical results by content hash, elides over-budget results behind artifact:// handles, audits the request envelope with copy-paste omp config advice, reports the account behind the active model \u2014 DeepSeek's polled balance, LithosAI's published rates, and the session's USD cost on either \u2014 and registers the LithosAI provider with its /login flow, 1M-token context windows, measured tokens/second and per-minute rate-limit budgets. Every metric is drawn on ONE status row. Never rewrites history, so every provider's prefix cache keeps its hits.",
+      "version": "2.0.0",
       "category": "development",
       "source": "./",
       "homepage": "https://github.com/dillydalli3r/omp-token-mega",

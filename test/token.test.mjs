@@ -3,8 +3,8 @@
  *
  * Scope is the part of the plugin that can be wrong in a way nobody would notice: the
  * reducer's arithmetic, its determinism, the admission test that decides whether a rewrite
- * is worth making, configuration resolution across five layers, and the hook pipeline
- * driven end to end against a fake extension host.
+ * is worth making, the ledger every result is booked into, configuration resolution across
+ * five layers, and the hook pipeline driven end to end against a fake extension host.
  *
  * Every end-to-end test pins *all* plugin settings through their environment variables
  * (`pinConfig`). Environment is the highest resolution layer, so pinning it makes the run
@@ -34,7 +34,7 @@ import {
 } from "../src/compress.js";
 import { CONFIG_SCHEMA, defaultConfig, loadConfig, presetValues, toolSelected } from "../src/config.js";
 import { createDuplicateIndex } from "../src/dedupe.js";
-import { estimateTokens, formatBytes, formatTokens, lineCost, tokensFromBytes } from "../src/measure.js";
+import { estimateTokens, formatBytes, formatTokens, lineCost, tokensFromBytes, utf8Bytes } from "../src/measure.js";
 import { parseScalars, recommendedSpillThreshold, systemPromptSections } from "../src/audit.js";
 import { makeHost, withConfig } from "./harness.mjs";
 
@@ -555,6 +555,106 @@ await test("a failing artifact writer degrades instead of failing the tool call"
 		assert.ok(out, "the result is still elided");
 		assert.ok(out.content[0].text.includes("not stashed"), "and it says recovery is unavailable");
 	});
+});
+
+await test("the ledger holds after every step: the passes' gross less their markers is what the transcript lost", async () => {
+	// Read off the section a user reads, and against the bytes the reducer actually returned:
+	// after *every* result the six pass figures must sum to the printed gross, the markers
+	// printed on their own row must be the ones the headline subtracts, and the net must be the
+	// transcript's own byte delta. A pass that booked a saving it did not make, or a marker that
+	// was never charged, breaks one of those three. The fixtures stay under a kilobyte in every
+	// figure, which is where `formatBytes` prints exact bytes rather than a rounded `1.2 KB`.
+	await withConfig(
+		{
+			"token.minChars": 0,
+			"token.minSavingsTokens": 0,
+			"token.fold": false,
+			"token.clip": 0,
+			"token.json": false,
+			"token.dedupe": true,
+			"token.maxChars": 600,
+			"token.headChars": 280,
+			"token.tailChars": 280,
+		},
+		async () => {
+			const host = await makeHost();
+			await host.start();
+
+			const transcript = { in: 0, out: 0 };
+			const send = async (text) => {
+				const [out] = await host.toolResult(text);
+				transcript.in += utf8Bytes(text);
+				transcript.out += out ? utf8Bytes(out.content[0].text) : utf8Bytes(text);
+			};
+
+			const ledger = async () => {
+				await host.commands.get("mega").handler("report", host.ctx);
+				const section = String(host.messages.at(-1)?.content ?? "");
+				// Every figure is asserted present before it is used: a printed `1.2 KB` would
+				// fail here rather than being parsed as a wrong number.
+				const figures = (pattern, what) => {
+					const match = section.match(pattern);
+					assert.ok(match, `the section must print ${what} in exact bytes:\n${section}`);
+					return match.slice(1).map(Number);
+				};
+				const [saved, , gross, markers] = figures(
+					/- Removed from the transcript: (\d+) B \(~(\d+) tok, est\.\) — (\d+) B removed by the passes below, less (\d+) B of provenance markers/,
+					"the ledger headline",
+				);
+				const [lossless, squeeze, fold, clip, json] = figures(
+					/- lossless passes (\d+) B \(squeeze (\d+) B, fold (\d+) B, clip (\d+) B, json (\d+) B\)/,
+					"the lossless breakdown",
+				);
+				const [elide, dedupe] = figures(/- budget elision (\d+) B; duplicates collapsed (\d+) B/, "the elision and duplicate figures");
+				const [markerRow] = figures(/- provenance markers written into the reduced results: (\d+) B/, "the marker row");
+				return { saved, gross, markers, markerRow, lossless, squeeze, fold, clip, json, elide, dedupe };
+			};
+
+			const step = async (label, text) => {
+				await send(text);
+				const figure = await ledger();
+				const seen = JSON.stringify(figure);
+				assert.equal(
+					figure.gross,
+					figure.squeeze + figure.fold + figure.clip + figure.json + figure.elide + figure.dedupe,
+					`${label}: the printed passes must sum to the printed gross ${seen}`,
+				);
+				assert.equal(figure.markers, figure.markerRow, `${label}: the headline must subtract the marker row's own figure ${seen}`);
+				assert.equal(figure.saved, figure.gross - figure.markers, `${label}: the net must be the gross less the markers ${seen}`);
+				assert.equal(figure.saved, transcript.in - transcript.out, `${label}: the net must be the bytes the transcript lost ${seen}`);
+				return figure;
+			};
+
+			const noisy = "\u001b[31mwarning\u001b[0m: disk almost full   \n".repeat(10);
+			const afterLossless = await step("a losslessly reduced result", noisy);
+			assert.ok(afterLossless.squeeze > 0, "the lossless pass must have been admitted and booked");
+			assert.equal(afterLossless.elide, 0, "a result under the budget is not elided");
+			assert.equal(afterLossless.dedupe, 0, "the session has seen nothing twice yet");
+
+			// The repeated payload has to clear the index's own 512-character floor, below
+			// which a back-reference would cost more than the text it replaces.
+			const payload = Array.from({ length: 80 }, (_, i) => `row ${i}`).join("\n");
+			const afterFirstCopy = await step("a first copy", payload);
+			assert.equal(afterFirstCopy.dedupe, 0, "the first copy is sent as produced, so nothing is collapsed");
+			const afterDuplicate = await step("a duplicate", payload);
+			assert.ok(afterDuplicate.dedupe > 0, "the duplicate must be booked as a removal");
+
+			const afterElision = await step("an over-budget result", "C".repeat(810));
+			assert.ok(afterElision.elide > 0, "the elision must be booked as a removal");
+
+			// An elision that cannot pay for the marker advertising it is refused outright: it
+			// books no pass, no marker and no net, so the attempt leaves the ledger untouched.
+			const afterRefusal = await step("an elision that does not pay", "R".repeat(620));
+			assert.deepEqual(afterRefusal, afterElision, "a refused rewrite must not book a partial credit");
+
+			assert.equal(
+				host.row?.includes(`TS -${formatBytes(afterRefusal.saved)} (~${formatTokens(tokensFromBytes(afterRefusal.saved))} tok)`),
+				true,
+				`the row must carry the ledger's own figure: ${host.row}`,
+			);
+			assert.equal(host.row?.includes("3/5 results"), true, host.row);
+		},
+	);
 });
 
 await test("counters, report, config, audit and preset all render", async () => {

@@ -5,9 +5,10 @@
  * and **one status row**:
  *
  *   token    reduce a tool result before it is ever sent (any provider)
- *   cache    measure the DeepSeek prefix cache: hit rate, miss attribution, drift
+ *   cache    measure the prefix cache — hit rate, miss attribution, drift — on every model
+ *            whose provider reports cached input tokens and declares a cache-read rate
  *   lithos   register LithosAI (models, /login), measure its speed and budgets
- *   balance  DeepSeek account balance and this session's USD spend
+ *   balance  the account behind the model, and this session's USD cost
  *
  * The status row is the reason they were merged: one line, one key, every metric a part of
  * it — three plugins used to mean three rows of chrome for the rest of the session. The row
@@ -24,11 +25,12 @@
  *   /mega menu             the menu spelled out (a bare /mega opens it too)
  *   /mega preset [name]    list or switch the token-saving preset bundle
  *   /mega audit            where this session's input tokens go, and which omp knobs to change
- *   /mega cache [doctor|fix|rollback]   cache section, or compat-key repair
- *   /mega lithos           LithosAI catalogue, speed, per-minute budgets and spend
- *   /mega balance          account balance and the session spend table
+ *   /mega cache [report|doctor|fix|rollback|stability]
+ *                          cache section, compat-key repair, append-only context stability
+ *   /mega lithos           LithosAI catalogue, speed, per-minute budgets and cost
+ *   /mega balance          the account behind the model and the session cost table
  *   /mega reset            zero this session's counters
- *   tool `deepseek_balance`  the same figures for the model itself
+ *   tool `account_balance` the same figures for the model itself
  *
  * The menu and the subcommands are the same code: each entry calls the action the
  * subcommand calls, so nothing is reachable one way but not the other.
@@ -110,7 +112,6 @@ export default function tokenMega(pi) {
 	function row() {
 		const segments = {
 			cache: features.cache?.segment(),
-			lithos: features.lithos?.segment(),
 			balance: features.balance?.segment(),
 			token: features.token?.segment(),
 		};
@@ -312,12 +313,16 @@ export default function tokenMega(pi) {
 			say(await features.cache.doctor(ctx));
 			return;
 		}
+		if (action === "stability") {
+			say(await features.cache.stability(ctx));
+			return;
+		}
 		if (action === "fix" || action === "rollback") {
 			const outcome = action === "fix" ? await features.cache.repair(ctx) : await features.cache.undo(ctx);
 			ctx.ui.notify(outcome.message, outcome.level);
 			return;
 		}
-		ctx.ui.notify("Usage: `/mega cache [report|doctor|fix|rollback]`.", "error");
+		ctx.ui.notify("Usage: `/mega cache [report|doctor|fix|rollback|stability]`.", "error");
 	}
 
 	/** Apply a preset through omp's CLI, then report which layer actually supplies it. */
@@ -349,6 +354,7 @@ export default function tokenMega(pi) {
 		["doctor", "Doctor — scan the model config for inert compat keys"],
 		["fix", "Repair — remove the inert keys (writes a backup first)"],
 		["rollback", "Rollback — undo the last repair"],
+		["stability", "Prefix stability — is omp's append-only context mode on?"],
 	];
 
 	/**
@@ -365,8 +371,8 @@ export default function tokenMega(pi) {
 			{ label: "Settings as text — every key, value and source", run: () => showConfig(ctx) },
 			{ label: "Token audit — request envelope and omp knobs", run: () => showAudit(ctx) },
 			{ label: "Cache — report, doctor, repair, rollback", run: () => pickCache(ctx) },
-			{ label: "LithosAI — models, speed, budgets, spend", run: () => say(features.lithos.section(ctx)) },
-			{ label: "DeepSeek balance — account and session spend", run: async () => say(await features.balance.section(ctx)) },
+			{ label: "LithosAI — models, speed, budgets, cost", run: () => say(features.lithos.section(ctx)) },
+			{ label: "Account — balance, cost, session spend", run: async () => say(await features.balance.section(ctx)) },
 			{ label: "Reset counters — zero this session", run: () => resetCounters(ctx) },
 		];
 	}
@@ -407,9 +413,9 @@ export default function tokenMega(pi) {
 		"- `/mega menu` — the menu, spelled out",
 		`- \`/mega preset [${PRESET_NAMES.join("|")}]\` — show or switch the token-saving bundle`,
 		"- `/mega audit` — request-envelope token audit and omp knob advice",
-		"- `/mega cache [doctor|fix|rollback]` — cache section, or compat-key repair",
-		"- `/mega lithos` — LithosAI: catalogue, speed, per-minute budgets, session spend",
-		"- `/mega balance` — DeepSeek account balance and the session spend table",
+		"- `/mega cache [report|doctor|fix|rollback|stability]` — cache section, compat keys, append-only",
+		"- `/mega lithos` — LithosAI: catalogue, speed, per-minute budgets, session cost",
+		"- `/mega balance` — the account behind the model, and the session cost table",
 		"- `/mega reset` — zero this session's counters",
 	].join("\n");
 

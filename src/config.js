@@ -19,10 +19,11 @@
  * the manifest schema advertises to `omp plugin config list`.
  *
  * Keys are grouped with a dotted prefix — `token.*` for the tool-result reducer, `cache.*`
- * for the DeepSeek prefix-cache accounting, `balance.*` for the account poller — and the
- * unprefixed keys configure the shell itself (the master switch, the single status row,
- * the shard directory). Verified against omp 18.2.6: `omp plugin config set` stores a
- * dotted key verbatim, so a group prefix is a naming convention and never a nested path.
+ * for the prefix-cache accounting of any provider that reports cached input, `balance.*`
+ * for the account poller — and the unprefixed keys configure the shell itself (the master
+ * switch, the single status row, the shard directory). Verified against omp 18.2.6: `omp
+ * plugin config set` stores a dotted key verbatim, so a group prefix is a naming
+ * convention and never a nested path.
  *
  * The preset layer is what makes the extremes reachable in one command. `/mega preset max`
  * (or `token.preset` in any other layer) selects a coherent bundle of the `token.*` keys;
@@ -43,7 +44,7 @@ import { LITHOS_BASE_URL } from "./lithosai.js";
 const NOISY_TOOLS = "bash,grep,glob,web_search,eval,mcp__*";
 
 /** The groups a status-row segment can come from, in the default display order. */
-export const STATUS_SEGMENTS = ["cache", "lithos", "balance", "token"];
+export const STATUS_SEGMENTS = ["cache", "balance", "token"];
 
 export const CONFIG_SCHEMA = {
 	enabled: {
@@ -68,7 +69,7 @@ export const CONFIG_SCHEMA = {
 	},
 	statusSegments: {
 		type: "string",
-		default: "cache,lithos,balance,token",
+		default: "cache,balance,token",
 		env: "OMP_TOKEN_MEGA_STATUS_SEGMENTS",
 		description: `Which groups the row shows, in order: ${STATUS_SEGMENTS.join(", ")}. Unknown names are ignored; an empty list hides the row.`,
 	},
@@ -216,7 +217,24 @@ export const CONFIG_SCHEMA = {
 		type: "boolean",
 		default: true,
 		env: "OMP_TOKEN_MEGA_CACHE_ENABLED",
-		description: "Measure the DeepSeek prefix cache: accounting, miss attribution, drift notes. Active only while a DeepSeek model is loaded.",
+		description:
+			"Measure the prefix cache: accounting, miss attribution, drift notes. Active while the live model is cache capable — its provider is one that reports cached input, or its own card prices cached reads.",
+	},
+	"cache.minPrefixTokens": {
+		type: "number",
+		default: 1024,
+		min: 0,
+		max: 1000000,
+		env: "OMP_TOKEN_MEGA_CACHE_MIN_PREFIX_TOKENS",
+		description:
+			"Prefixes shorter than this are below most providers' minimum cacheable unit, so a miss on one is labelled `prefix_too_small` instead of being chased — there is no client-side change that turns such a request into a hit. Gemini's implicit cache floor is 1024 tokens on the 2.5+ tiers, which is the default. 0 disables the label.",
+	},
+	"cache.appendOnly": {
+		type: "boolean",
+		default: true,
+		env: "OMP_TOKEN_MEGA_CACHE_APPEND_ONLY",
+		description:
+			"Report whether omp's append-only context mode is on for the live provider, and name the one command that turns it on (`omp config set provider.appendOnlyContext on`) where it is not. Read-only: the plugin never writes omp settings itself, it only tells you the setting exists.",
 	},
 	"cache.subagents": {
 		type: "boolean",
@@ -246,7 +264,7 @@ export const CONFIG_SCHEMA = {
 		default: true,
 		env: "OMP_TOKEN_MEGA_LITHOS_ENABLED",
 		description:
-			"Register the LithosAI provider (models, /login, usage reporting), measure its speed and per-minute budgets, and draw its segment. Requires a restart to take effect when switched off.",
+			"Register the LithosAI provider (models, /login, usage reporting) and measure its speed and per-minute budgets for the report. Requires a restart to take effect when switched off.",
 	},
 	"lithos.baseUrl": {
 		type: "string",
@@ -260,7 +278,7 @@ export const CONFIG_SCHEMA = {
 		min: 0,
 		max: 100000,
 		env: "OMP_TOKEN_MEGA_LITHOS_INPUT_PER_MILLION",
-		description: "USD per million input tokens, from the console's rate card. 0 leaves cost unknown and the spend columns read $0.",
+		description: "USD per million input tokens. 0 uses the rate LithosAI publishes for the model; set it to override the published card (a console figure, an on-prem engine, a volume deal).",
 	},
 	"lithos.outputPerMillion": {
 		type: "number",
@@ -268,7 +286,7 @@ export const CONFIG_SCHEMA = {
 		min: 0,
 		max: 100000,
 		env: "OMP_TOKEN_MEGA_LITHOS_OUTPUT_PER_MILLION",
-		description: "USD per million output tokens. Cached input is a subset of input, not an addition to it.",
+		description: "USD per million output tokens. 0 uses the published rate. Cached input is a subset of input, not an addition to it.",
 	},
 	"lithos.cachedPerMillion": {
 		type: "number",
@@ -276,14 +294,15 @@ export const CONFIG_SCHEMA = {
 		min: 0,
 		max: 100000,
 		env: "OMP_TOKEN_MEGA_LITHOS_CACHED_PER_MILLION",
-		description: "USD per million cached input tokens.",
+		description: "USD per million cached input tokens. 0 uses the published rate.",
 	},
 
 	"balance.enabled": {
 		type: "boolean",
 		default: true,
 		env: "OMP_TOKEN_MEGA_BALANCE_ENABLED",
-		description: "Poll the DeepSeek account balance for the status row. Off means no balance request is ever made; session spend is unaffected.",
+		description:
+			"Poll the account balance for the status row where one is published (DeepSeek's is; LithosAI publishes none, so its section reports the credit state the wire shows instead). Off means no balance request is ever made; session cost is unaffected.",
 	},
 	"balance.ttlSeconds": {
 		type: "number",
