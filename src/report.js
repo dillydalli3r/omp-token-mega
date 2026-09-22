@@ -83,7 +83,7 @@ export function tokenSection({ config, stats, perf, index, model }) {
 }
 
 /** The other sections in display order, so one command explains the whole plugin. */
-export const REPORT_SECTIONS = ["token", "cache", "lithos", "balance"];
+export const REPORT_SECTIONS = ["token", "cache", "tune", "lithos", "balance"];
 
 /**
  * Assemble the merged document. `sections` maps a section name to its markdown, or to
@@ -106,6 +106,7 @@ export function megaReport({ model, sessionId, preset, sections }) {
 		"- `/mega menu` — change any of them interactively, grouped by feature.",
 		"- `/mega preset <name>` — switch the token-saving bundle: `off`, `conservative`, `balanced`, `aggressive`, `max`.",
 		"- `/mega audit` — where this session's input tokens actually go, and which omp knobs to change.",
+		"- `/mega tune [apply|save|revert]` — the core settings this model wants changed, applied as session overrides or written to your config.",
 		"- `/mega cache doctor` — scan the model config for inert compat keys; `fix` removes them, `rollback` restores.",
 	);
 	if (sessionId) lines.push("", `Session \`${sessionId}\`.`);

@@ -115,9 +115,28 @@ elided the result (the `skipped.native` counter). Where it stashes removed text 
 spill uses, so the model needs no new vocabulary to recover it.
 
 What `/tokens audit` adds is reporting, not replacement. It reads oh-my-pi's own settings
-(`CORE_DEFAULTS` in `src/audit.js`), lists each native mechanism above with its current value,
-scores the request envelope — tool catalogue, system-prompt sections, never-called tools — and
-prints the `omp config set …` command for any knob it would change. It never writes one.
+(`CORE_DEFAULTS` in `src/audit.js`), lists each native mechanism above with its value, scores
+the request envelope — tool catalogue, system-prompt sections, never-called tools — and prints
+the `omp config set …` command for any knob it would change. `/mega tune` is the one thing in
+this plugin that writes such a knob, and only when run: through the live `Settings` singleton
+oh-my-pi injects as `pi.pi.settings`, as `override()` (process-scoped, not persisted) unless
+`save` is asked for, with the prior values kept in a receipt so `revert` can replay them.
+
+Two more of oh-my-pi's own surfaces are read rather than reimplemented:
+
+- the usage route `GET {base}/v1/usage` and its three windows (`rolling`, `weekly`, `monthly`),
+  including the all-or-nothing rule that a partial report must not overwrite a complete one —
+  the same contract `@oh-my-pi/pi-ai`'s `opencodeGoUsageProvider` implements, reimplemented
+  here because a plugin cannot import the host's internals;
+- the auto-append-only rule in `config/append-only-context-mode.ts` (`shouldEnableAppendOnlyContext`),
+  mirrored in `appendOnlyAutoEnabled` so the plugin can say *why* a provider is not covered
+  instead of only that it is not.
+
+The knob recommendations in `/mega tune` are grounded in the host's own schema defaults
+(`src/config/settings-schema.ts`): `todo.remindersMax` 3, `task.softRequestBudget` 200 with a
+force-stop at 1.5×, `bash.autoBackground.thresholdMs` 60000, `tools.artifactSpillThreshold`
+50 KB, `retry.waitForUsageReset` false. Each recommendation is the difference between that
+default and what a long session on a prefix-cached gateway actually needs.
 
 ### Deliberately not implemented
 

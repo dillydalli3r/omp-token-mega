@@ -1,7 +1,7 @@
 {
   "name": "@dillydalli3r/omp-token-mega",
-  "version": "2.0.0",
-  "description": "One oh-my-pi plugin for the token economy: prefix-cache accounting and advice for every provider whose models report cached input tokens (DeepSeek, OpenCode Go, Google Gemini, LithosAI, Anthropic, OpenAI), a cache-safe reducer that shrinks a tool result before it is first sent, the account behind the active model with the session's USD cost, and the LithosAI provider with published rates, measured tokens/second and rate-limit metrics. One command, one settings menu, one status row.",
+  "version": "3.0.0",
+  "description": "One oh-my-pi plugin for the token economy: prefix-cache accounting and advice for every provider whose models report cached input tokens (DeepSeek, OpenCode Go, Google Gemini, LithosAI, Anthropic, OpenAI), a cache-safe reducer that shrinks a tool result before it is ever sent, a governor that applies the core settings which keep that prefix byte-stable and cheap (session overrides, revertible), and the account behind the model — balance, quota windows with burn rate, and this session's USD cost — on one status row.",
   "license": "MIT",
   "author": "dillydalli3r",
   "type": "module",
@@ -38,7 +38,14 @@
     "gemini",
     "anthropic",
     "openai",
-    "opencode"
+    "opencode",
+    "usage-windows",
+    "rate-limit",
+    "quota",
+    "tuning",
+    "cost-optimization",
+    "deepseek-v4",
+    "budget"
   ],
   "omp": {
     "extensions": [
@@ -67,9 +74,9 @@
       },
       "statusSegments": {
         "type": "string",
-        "default": "cache,balance,token",
+        "default": "cache,window,balance,token",
         "env": "OMP_TOKEN_MEGA_STATUS_SEGMENTS",
-        "description": "Which groups the row shows, in order: cache, balance, token. Unknown names are ignored; an empty list hides the row."
+        "description": "Which groups the row shows, in order: cache, window, balance, token. Unknown names are ignored; an empty list hides the row."
       },
       "stateDir": {
         "type": "string",
@@ -228,7 +235,7 @@
         "type": "boolean",
         "default": true,
         "env": "OMP_TOKEN_MEGA_CACHE_APPEND_ONLY",
-        "description": "Report whether omp's append-only context mode is on for the live provider, and name the one command that turns it on (`omp config set provider.appendOnlyContext on`) where it is not. Read-only: the plugin never writes omp settings itself, it only tells you the setting exists."
+        "description": "Report whether omp's append-only context mode is on for the live provider, where it is not, and what it costs to leave it off. `/mega tune` is the one place that writes it — as a session override, never to your config, unless you ask for that — and `/mega tune revert` takes it back."
       },
       "cache.subagents": {
         "type": "boolean",
@@ -301,6 +308,20 @@
         "max": 3600,
         "env": "OMP_TOKEN_MEGA_BALANCE_TTL_SECONDS",
         "description": "How long a fetched balance is reused before the poller refreshes it."
+      },
+      "window.enabled": {
+        "type": "boolean",
+        "default": true,
+        "env": "OMP_TOKEN_MEGA_WINDOW_ENABLED",
+        "description": "Poll the provider's quota windows and show the headroom left in them, in the row and in the report. Today that is OpenCode Go's 5-hour, weekly and monthly windows (`GET /v1/usage`), the figures that decide whether a session can still bill. Off means no request is ever made."
+      },
+      "window.warnAt": {
+        "type": "number",
+        "default": 80,
+        "min": 50,
+        "max": 99,
+        "env": "OMP_TOKEN_MEGA_WINDOW_WARN_AT",
+        "description": "Percent of a quota window at which the row turns yellow and the report starts advising a slower pace. Reaching 100%, or the provider answering `rate-limited`, turns it red: the session is about to stop, not slow down."
       }
     }
   },
@@ -313,8 +334,8 @@
     "CREDITS.md"
   ],
   "scripts": {
-    "check": "node --check src/index.js && node --check src/config.js && node --check src/status.js && node --check src/report.js && node --check src/menu.js && node --check src/token.js && node --check src/cache.js && node --check src/balance.js && node --check src/balance-client.js && node --check src/compress.js && node --check src/dedupe.js && node --check src/measure.js && node --check src/audit.js && node --check src/stats.js && node --check src/prefix.js && node --check src/deepseek.js && node --check src/repair.js && node --check src/usage.js && node --check src/lithosai.js && node --check src/model.js",
-    "test": "node test/token.test.mjs && node test/cache.test.mjs && node test/lithosai.test.mjs && node test/balance.test.mjs && node test/shell.test.mjs",
+    "check": "node --check src/index.js && node --check src/config.js && node --check src/status.js && node --check src/report.js && node --check src/menu.js && node --check src/token.js && node --check src/cache.js && node --check src/balance.js && node --check src/tune.js && node --check src/window.js && node --check src/balance-client.js && node --check src/compress.js && node --check src/dedupe.js && node --check src/measure.js && node --check src/audit.js && node --check src/stats.js && node --check src/prefix.js && node --check src/deepseek.js && node --check src/repair.js && node --check src/usage.js && node --check src/lithosai.js && node --check src/model.js",
+    "test": "node test/token.test.mjs && node test/cache.test.mjs && node test/lithosai.test.mjs && node test/balance.test.mjs && node test/shell.test.mjs && node test/tune.test.mjs && node test/window.test.mjs",
     "manifest": "node scripts/manifest.mjs"
   },
   "engines": {

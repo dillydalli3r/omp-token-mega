@@ -59,6 +59,7 @@ import { installToken } from "./token.js";
 import { installCache } from "./cache.js";
 import { installBalance } from "./balance.js";
 import { installLithos } from "./lithosai.js";
+import { advisoryRows, apply as applyTune, formatPlan, formatReceipt, plan as planTune, revert as revertTune, subagentAdvice } from "./tune.js";
 
 const STATUS_KEY = "omp-token-mega";
 const CUSTOM_TYPE = "omp-token-mega";
@@ -112,6 +113,7 @@ export default function tokenMega(pi) {
 	function row() {
 		const segments = {
 			cache: features.cache?.segment(),
+			window: features.balance?.windowSegment(),
 			balance: features.balance?.segment(),
 			token: features.token?.segment(),
 		};
@@ -265,6 +267,7 @@ export default function tokenMega(pi) {
 		const sections = {
 			token: features.token.section(ctx),
 			cache: await features.cache.section(ctx),
+			tune: tuneSection(ctx),
 			lithos: features.lithos.section(ctx),
 			balance: await features.balance.section(ctx),
 		};
@@ -339,6 +342,170 @@ export default function tokenMega(pi) {
 		render();
 	}
 
+	/**
+	 * omp's live `Settings` singleton, reached through the package namespace the host injects
+	 * as `pi.pi`. This is the only handle a plugin has on core settings — there is no
+	 * extension-facing API for them — so it is feature-detected, and its absence (an older
+	 * host, a test host) turns the tuning feature into advice rather than an error.
+	 */
+	function coreSettings() {
+		const settings = pi.pi?.settings;
+		return settings && typeof settings.get === "function" && typeof settings.override === "function" ? settings : undefined;
+	}
+
+	/** The live model, without the `provider/id` formatting `modelKey` does. */
+	function liveModel(ctx) {
+		try {
+			return ctx?.models?.current?.() ?? ctx?.model;
+		} catch {
+			return undefined;
+		}
+	}
+
+	/**
+	 * Every model this session can call — the same set `--model` picks from. Used for one
+	 * question only: is there a cheaper sibling on the live provider to delegate to.
+	 */
+	function availableModels(ctx) {
+		try {
+			return ctx?.models?.list?.() ?? [];
+		} catch {
+			return [];
+		}
+	}
+
+	/**
+	 * The live model role, which omp writes as `provider/model:effort`. The effort suffix is
+	 * the only place a session-wide thinking level is pinned, so it is read (never written)
+	 * by the advice side of the tuner.
+	 */
+	function roleSelector() {
+		try {
+			const roles = coreSettings()?.getModelRoles?.() ?? coreSettings()?.get?.("modelRoles");
+			return typeof roles?.default === "string" ? roles.default : undefined;
+		} catch {
+			return undefined;
+		}
+	}
+
+	/** Last tuning write, so `/mega tune revert` can undo exactly it. Session-scoped, like the writes. */
+	const tuneState = { receipt: undefined };
+
+	function tunePlan(ctx, { force = false } = {}) {
+		return planTune({ model: liveModel(ctx), settings: coreSettings(), receipt: tuneState.receipt, force });
+	}
+
+	/**
+	 * The tuning section: the knobs this model wants changed, what is advice rather than a
+	 * change, and what this session already applied. `undefined` when there is nothing to say,
+	 * so a session that is already tuned does not carry a table in every report.
+	 */
+	function tuneSection(ctx) {
+		const result = tunePlan(ctx);
+		const advice = coreSettings() ? advisoryRows({ model: liveModel(ctx), settings: coreSettings(), roleSelector: roleSelector() }) : [];
+		const subagent = subagentAdvice({ model: liveModel(ctx), models: availableModels(ctx), settings: coreSettings() });
+		if (!result && advice.length === 0 && !subagent) {
+			return coreSettings()
+				? undefined
+				: "### Tuning\n\n- Core settings are not reachable from this host (`pi.pi.settings` is unavailable), so nothing can be read or written here. Apply the advice below with `omp config set`.";
+		}
+		const lines = ["### Tuning", ""];
+		if (result) lines.push(formatPlan(result));
+		else lines.push("- No core settings handle: every recommendation below is advice to apply by hand.");
+		if (tuneState.receipt) lines.push("", `- Applied this session: ${formatReceipt(tuneState.receipt)}`);
+		if (advice.length > 0 || subagent) {
+			lines.push("", "#### Yours to change", "");
+			for (const row of advice) {
+				lines.push(`- \`${row.key}\` at \`${row.current ?? "unset"}\` — \`${row.command}\``);
+				lines.push(`  - ${row.why}`);
+			}
+			if (subagent) {
+				lines.push(`- \`${subagent.key}\` — \`${subagent.command}\``);
+				lines.push(`  - ${subagent.why}`);
+			}
+		}
+		if (result && result.status.change > 0) {
+			lines.push("", "- Apply for this session: `/mega tune apply` (runtime overrides, undone by `/mega tune revert`). Write them to your config: `/mega tune save`.");
+		}
+		return lines.join("\n");
+	}
+
+	/** Write the recommendation, either as session overrides or into the user's config. */
+	async function applyTuning(ctx, { persist = false, force = false } = {}) {
+		const result = tunePlan(ctx, { force });
+		if (!result) {
+			ctx.ui.notify("Core settings are not reachable from this host; nothing can be written.", "error");
+			return;
+		}
+		if (result.changes.length === 0) {
+			ctx.ui.notify(
+				result.status.pinned > 0
+					? `Nothing to apply: ${result.status.pinned} knob(s) are yours (\`/mega tune\` lists them with the command to change them).`
+					: "Nothing to apply: this model is already tuned.",
+				"info",
+			);
+			return;
+		}
+		const receipt = applyTune(coreSettings(), result.changes, { persist });
+		tuneState.receipt = receipt;
+		ctx.ui.notify(`${formatReceipt(receipt)}${persist ? "" : " — session only; `/mega tune save` writes them to config."}`, "info");
+		await reload(ctx);
+		render();
+	}
+
+	async function revertTuning(ctx) {
+		if (!tuneState.receipt) {
+			ctx.ui.notify("Nothing to revert: no tuning was applied this session.", "info");
+			return;
+		}
+		const outcome = revertTune(coreSettings(), tuneState.receipt);
+		tuneState.receipt = undefined;
+		ctx.ui.notify(
+			`Reverted ${outcome.clearedOverride.length + outcome.restored.length} setting(s)${outcome.restored.length ? ` (${outcome.restored.join(", ")} written back)` : ""}.`,
+			"info",
+		);
+		await reload(ctx);
+		render();
+	}
+
+	async function showTune(ctx, action) {
+		if (action === undefined || action === "plan") {
+			say(tuneSection(ctx) ?? "### Tuning\n\n- This model is already tuned, and no knob is waiting on you.");
+			return;
+		}
+		if (action === "apply") {
+			await applyTuning(ctx);
+			return;
+		}
+		if (action === "save") {
+			await applyTuning(ctx, { persist: true });
+			return;
+		}
+		if (action === "revert") {
+			await revertTuning(ctx);
+			return;
+		}
+		if (action === "force") {
+			await applyTuning(ctx, { force: true });
+			return;
+		}
+		ctx.ui.notify("Usage: `/mega tune [apply|save|revert|force]`.", "error");
+	}
+
+	async function pickTune(ctx) {
+		const choice = await ctx.ui.select("Tuning — the cost and time profile for this model", [
+			"Show — the plan, and what is yours to change",
+			"Apply — for this session (runtime overrides)",
+			"Save — write them to your config",
+			"Revert — undo what this session applied",
+			"Force — re-offer knobs your own config pins",
+			"Back",
+		]);
+		const action = { Show: "plan", Apply: "apply", Save: "save", Revert: "revert", Force: "force" }[String(choice).split(" ")[0]];
+		if (!action) return;
+		await showTune(ctx, action);
+	}
+
 	async function resetCounters(ctx) {
 		features.token.reset();
 		features.lithos.reset();
@@ -370,9 +537,10 @@ export default function tokenMega(pi) {
 			{ label: `Token preset — currently ${config().preset}`, run: () => pickPreset(ctx) },
 			{ label: "Settings as text — every key, value and source", run: () => showConfig(ctx) },
 			{ label: "Token audit — request envelope and omp knobs", run: () => showAudit(ctx) },
+			{ label: "Tune — the cost and time profile for this model", run: () => pickTune(ctx) },
 			{ label: "Cache — report, doctor, repair, rollback", run: () => pickCache(ctx) },
 			{ label: "LithosAI — models, speed, budgets, cost", run: () => say(features.lithos.section(ctx)) },
-			{ label: "Account — balance, cost, session spend", run: async () => say(await features.balance.section(ctx)) },
+			{ label: "Account — balance, quota windows, session spend", run: async () => say(await features.balance.section(ctx)) },
 			{ label: "Reset counters — zero this session", run: () => resetCounters(ctx) },
 		];
 	}
@@ -413,9 +581,10 @@ export default function tokenMega(pi) {
 		"- `/mega menu` — the menu, spelled out",
 		`- \`/mega preset [${PRESET_NAMES.join("|")}]\` — show or switch the token-saving bundle`,
 		"- `/mega audit` — request-envelope token audit and omp knob advice",
+		"- `/mega tune [apply|save|revert]` — the cost and time profile for this model: what to change, applied for the session or written to config",
 		"- `/mega cache [report|doctor|fix|rollback|stability]` — cache section, compat keys, append-only",
 		"- `/mega lithos` — LithosAI: catalogue, speed, per-minute budgets, session cost",
-		"- `/mega balance` — the account behind the model, and the session cost table",
+		"- `/mega balance` — the account behind the model: balance, quota windows, session cost table",
 		"- `/mega reset` — zero this session's counters",
 	].join("\n");
 
@@ -498,6 +667,11 @@ export default function tokenMega(pi) {
 
 			if (sub === "audit") {
 				await showAudit(ctx);
+				return;
+			}
+
+			if (sub === "tune") {
+				await showTune(ctx, parts[1]);
 				return;
 			}
 

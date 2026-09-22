@@ -96,6 +96,60 @@ export const UNPRICED_MODEL = {
 	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 };
 
+/**
+ * The payload `GET /v1/usage` answers with on the OpenCode Go gateway: three quota windows,
+ * each a floored percent, a status word and the ISO instant it resets. The shape is the one
+ * omp's own usage provider decodes, so a suite drives the same numbers a session sees.
+ */
+export const WINDOW_PAYLOAD = {
+	usage: {
+		rolling: { percent: 12, status: "ok", resetsAt: "2026-09-21T12:00:00.000Z" },
+		weekly: { percent: 61, status: "ok", resetsAt: "2026-09-25T00:00:00.000Z" },
+		monthly: { percent: 88, status: "ok", resetsAt: "2026-10-01T00:00:00.000Z" },
+	},
+};
+
+/**
+ * A fake of the parts of omp's live `Settings` singleton the plugin reaches through
+ * `pi.pi.settings`: the same four write methods, the same read, the same "was this
+ * configured by a human" probe. `initial` is what the layers already hold (what a real
+ * session would have read from `config.yml`), and `configured` names the paths those values
+ * came from — anything else resolves to `fallback`.
+ *
+ * The real class persists `set()` and keeps `override()` for the process; this fake keeps
+ * both in maps and records every call, so a suite can assert which one the plugin chose.
+ */
+export function createFakeSettings({ initial = {}, configured = [], fallback = {} } = {}) {
+	const persisted = { ...initial };
+	const overrides = {};
+	const calls = [];
+	const values = () => ({ ...fallback, ...persisted, ...overrides });
+	const setting = {
+		calls,
+		persisted,
+		overrides,
+		get(path) {
+			return values()[path];
+		},
+		override(path, value) {
+			calls.push({ method: "override", path, value });
+			overrides[path] = value;
+		},
+		clearOverride(path) {
+			calls.push({ method: "clearOverride", path });
+			delete overrides[path];
+		},
+		set(path, value) {
+			calls.push({ method: "set", path, value });
+			persisted[path] = value;
+		},
+		isConfigured(path) {
+			return path in persisted || path in overrides || configured.includes(path);
+		},
+	};
+	return setting;
+}
+
 /** A provider with neither a cache-read rate nor a place among those measured: nothing to account for. */
 export const UNCACHED_MODEL = {
 	provider: "some-proxy",
@@ -172,6 +226,8 @@ export async function makeHost({
 	cwd,
 	agentDirOverride,
 	modelRegistry = {},
+	coreSettings = createFakeSettings(),
+	availableModels,
 } = {}) {
 	hostSeq += 1;
 	let activeModel = model;
@@ -237,7 +293,7 @@ export async function makeHost({
 				return scripted("confirm", title) === true || scripted("confirm", title) === "true";
 			},
 		},
-		models: { current: () => activeModel },
+		models: { current: () => activeModel, list: () => availableModels ?? (activeModel ? [activeModel] : []) },
 		model: activeModel,
 		modelRegistry,
 		sessionManager: {
@@ -283,6 +339,9 @@ export async function makeHost({
 			string: () => ({}),
 		},
 		setLabel() {},
+		// The package namespace the host injects: `pi.pi.settings` is omp's live `Settings`
+		// singleton, which is how the tuning feature reads and writes core settings.
+		pi: { settings: coreSettings },
 		registerProvider(name, config, sourceId) {
 			providers.set(name, { config, sourceId });
 		},
@@ -335,6 +394,7 @@ export async function makeHost({
 	const host = {
 		pi,
 		ctx,
+		coreSettings,
 		saved,
 		commands,
 		tools,

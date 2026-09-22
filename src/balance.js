@@ -22,6 +22,14 @@
  *              Reporting the session cost there is the whole point: a Gemini or
  *              opencode-go session shows its own spend where a DeepSeek session does.
  *
+ * A second account figure is not a balance at all: the quota windows a provider meters the
+ * account with. OpenCode Go publishes three (`GET /v1/usage`: 5-hour, weekly, monthly), each a
+ * percent used, a status and the instant it resets, and those are what decides whether a
+ * session can still bill — a spent window stops the work no matter how much credit is left.
+ * They are polled on the same timer, in the same refresh, with the same last-good-on-failure
+ * policy as a balance, and they are reported in the same section: the account behind the
+ * model, whether that account is a balance or a window.
+ *
  * Everything after that line is the same on all of them, which is the point: the used and
  * cached figures, the two buckets and the table are what a session costs on any of them.
  *
@@ -40,6 +48,7 @@ import { LITHOS_BILLING_URL, LITHOS_PROVIDER, lithosRates } from "./lithosai.js"
 import { money, percent } from "./measure.js";
 import { activeModel, cacheCapable, cachePriced, modelKey } from "./model.js";
 import { sessionSpend } from "./usage.js";
+import { burnRate, fetchUsage, usageEndpoint, windowParts, windowProvider, windowSection } from "./window.js";
 
 const BALANCE_RETRY_MS = 15_000;
 
@@ -82,6 +91,12 @@ export function installBalance(pi, shell) {
 		balance: undefined,
 		balanceError: undefined,
 		balanceFetchedAt: 0,
+		/** The quota windows last read from the provider, and what went wrong reading them. */
+		windows: undefined,
+		windowsError: undefined,
+		windowsFetchedAt: 0,
+		/** One `{ at, percent }` sample of the shortest window per refresh, for the burn rate. */
+		samples: [],
 		timer: undefined,
 		inFlight: false,
 		spendCache: { key: undefined, value: undefined },
@@ -91,6 +106,8 @@ export function installBalance(pi, shell) {
 
 	const values = () => shell.values();
 	const ttlMs = () => Math.max(15, Number(values()["balance.ttlSeconds"]) || 60) * 1000;
+	/** Percent at which a quota window turns yellow in the row and in the report. */
+	const warnAt = () => Math.min(99, Math.max(50, Number(values()["window.warnAt"]) || 80));
 
 	/**
 	 * The account the session is spending, or `undefined` when the model is not one this
@@ -116,7 +133,31 @@ export function installBalance(pi, shell) {
 	/** The master switch on one of the models this feature accounts for: the row segment's gate. */
 	const gated = () => values().enabled === true && accountOf(state.ctx) !== undefined;
 	/** Polling on top of the gate: only DeepSeek publishes a balance to poll. */
-	const polling = () => gated() && accountOf(state.ctx).provider === DEEPSEEK_PROVIDER && values()["balance.enabled"] === true;
+	const balancePolled = () => gated() && accountOf(state.ctx).provider === DEEPSEEK_PROVIDER && values()["balance.enabled"] === true;
+	/**
+	 * Windows are a second, independent account figure: a provider that publishes quota
+	 * windows has them polled whether or not it also publishes a balance, which is why this
+	 * is a gate of its own rather than a clause of the balance one.
+	 */
+	const windowPolled = () =>
+		gated() && values()["window.enabled"] === true && windowProvider(activeModel(state.ctx)) !== undefined;
+	/** The timer runs while *any* polled account figure is in scope. */
+	const polling = () => balancePolled() || windowPolled();
+
+	/**
+	 * The credential the live model's own request path would use. The usage route bills the
+	 * account behind that model, so it reads the same key the session's requests carry
+	 * rather than a provider-wide default.
+	 */
+	async function liveApiKey(ctx) {
+		try {
+			const resolved = await ctx?.modelRegistry?.getApiKeyAndHeaders?.(activeModel(ctx));
+			if (resolved?.ok) return resolved.apiKey;
+		} catch {
+			// An unreadable credential store is a missing poll, never a broken session.
+		}
+		return undefined;
+	}
 
 	function spendNow(ctx) {
 		const branch = ctx?.sessionManager?.getBranch?.() ?? [];
@@ -176,6 +217,22 @@ export function installBalance(pi, shell) {
 		return parts.join(" \u00b7 ");
 	}
 
+	/**
+	 * The `time` group's segment: headroom in the provider's quota windows and how long
+	 * until each resets. This is the figure that decides whether the session can still bill,
+	 * so it is composed from the same parts the report prints, tinted yellow as a window
+	 * approaches the configured limit and red once the provider is refusing requests.
+	 *
+	 * A model whose provider publishes no windows returns `undefined` — the group drops out
+	 * of the row rather than reporting a figure that does not exist.
+	 */
+	function windowSegment() {
+		if (values()["window.enabled"] !== true) return undefined;
+		if (!gated() || windowProvider(activeModel(state.ctx)) === undefined) return undefined;
+		if (!state.windows) return [state.windowsError ? "win \u2717" : "win \u2026"];
+		return windowParts(state.windows, { now: Date.now(), warnAt: warnAt() });
+	}
+
 	function stopTimer() {
 		if (!state.timer) return;
 		try {
@@ -190,29 +247,68 @@ export function installBalance(pi, shell) {
 		state.balance = undefined;
 		state.balanceError = undefined;
 		state.balanceFetchedAt = 0;
+		state.windows = undefined;
+		state.windowsError = undefined;
+		state.windowsFetchedAt = 0;
 		state.credit = undefined;
 	}
 
-	/** Balances are cached; the network call happens only when the cache is stale. */
-	async function refreshBalance({ force = false } = {}) {
+	/**
+	 * Account figures are cached; the network call happens only when the cache is stale.
+	 * One refresh serves both figures — a balance where one is published, quota windows
+	 * where they are — because they share a timer, a cadence and a failure policy.
+	 */
+	async function refreshAccount({ force = false } = {}) {
 		if (state.inFlight) return;
 		// Hard gate on the network path: a stale timer must never reach the API.
 		if (!polling()) return;
-		if (!force && Date.now() - state.balanceFetchedAt < ttlMs()) return;
+		const stale = Date.now() - Math.min(state.balanceFetchedAt, state.windowsFetchedAt) >= ttlMs();
+		if (!force && !stale) return;
 		state.inFlight = true;
 		try {
-			const { apiKey, baseUrl } = await resolveCredentials(state.ctx);
-			const result = await fetchBalance({ apiKey, baseUrl });
-			state.balanceFetchedAt = Date.now();
-			if (result.ok) {
-				state.balance = result.balance;
-				state.balanceError = undefined;
-			} else {
-				state.balanceError = result.error;
+			if (balancePolled()) {
+				const { apiKey, baseUrl } = await resolveCredentials(state.ctx);
+				const result = await fetchBalance({ apiKey, baseUrl });
+				state.balanceFetchedAt = Date.now();
+				if (result.ok) {
+					state.balance = result.balance;
+					state.balanceError = undefined;
+				} else {
+					state.balanceError = result.error;
+				}
 			}
+			if (windowPolled()) await refreshWindows();
 		} finally {
 			state.inFlight = false;
 			shell.render();
+		}
+	}
+
+	/**
+	 * Read the quota windows. The shortest window is also sampled for the burn rate: one
+	 * sample every refresh is what turns "12% used" into "at this pace, four hours left".
+	 */
+	async function refreshWindows() {
+		const endpoint = usageEndpoint(activeModel(state.ctx));
+		const apiKey = await liveApiKey(state.ctx);
+		const result = await fetchUsage({
+			endpoint: endpoint ?? undefined,
+			apiKey,
+			sessionId: state.ctx?.sessionManager?.getSessionId?.(),
+		});
+		state.windowsFetchedAt = Date.now();
+		if (!result?.windows) {
+			state.windowsError = apiKey ? "no usable usage report" : "no API key";
+			return;
+		}
+		state.windows = result.windows;
+		state.windowsError = undefined;
+		const shortest = result.windows[0];
+		if (shortest && Number.isFinite(shortest.percent)) {
+			state.samples.push({ at: result.fetchedAt ?? Date.now(), percent: shortest.percent });
+			// Two samples are enough for a slope; keeping a day of them bounds the array
+			// without ever dropping the pair the rate is read from.
+			if (state.samples.length > 24) state.samples.splice(0, state.samples.length - 24);
 		}
 	}
 
@@ -220,14 +316,15 @@ export function installBalance(pi, shell) {
 	function schedule() {
 		stopTimer();
 		if (!state.ctx || !polling()) return;
-		const delay = state.balanceError ? BALANCE_RETRY_MS : ttlMs();
+		const failed = state.balanceError !== undefined || state.windowsError !== undefined;
+		const delay = failed ? BALANCE_RETRY_MS : ttlMs();
 		state.timer = state.ctx.setTimeout(() => {
 			if (!polling()) {
 				stopTimer();
 				shell.render();
 				return;
 			}
-			void refreshBalance().then(schedule);
+			void refreshAccount().then(schedule);
 		}, delay);
 	}
 
@@ -238,7 +335,7 @@ export function installBalance(pi, shell) {
 	function reconcile(ctx) {
 		state.ctx = ctx;
 		if (polling()) {
-			if (!state.timer) void refreshBalance({ force: !state.balance }).then(schedule);
+			if (!state.timer) void refreshAccount({ force: !state.balance && !state.windows }).then(schedule);
 		} else {
 			stopTimer();
 			if (!gated()) forgetBalance();
@@ -279,7 +376,7 @@ export function installBalance(pi, shell) {
 			].join("\n");
 		}
 		state.ctx = ctx;
-		if (current.provider === DEEPSEEK_PROVIDER && values()["balance.enabled"] === true) await refreshBalance({ force: true });
+		await refreshAccount({ force: true });
 		const spend = sessionSpend(ctx.sessionManager?.getBranch?.() ?? []);
 		const lines = [`### ${current.label} account`, ""];
 
@@ -313,6 +410,20 @@ export function installBalance(pi, shell) {
 			);
 		}
 
+		if (windowPolled()) {
+			if (state.windows) {
+				const block = windowSection(state.windows, {
+					now: Date.now(),
+					warnAt: warnAt(),
+					percentPerHour: burnRate(state.samples),
+					endpoint: usageEndpoint(activeModel(ctx)),
+				});
+				if (block) lines.push("", block);
+			} else {
+				lines.push("", `- Usage windows: ${state.windowsError ? `unavailable (${state.windowsError})` : "not read yet"}.`);
+			}
+		}
+
 		lines.push(...spendTable(spend));
 		if (!current.priced) {
 			lines.push("", "Costs read $0 because this model is registered with no rates; the token columns are unaffected.");
@@ -320,9 +431,10 @@ export function installBalance(pi, shell) {
 		return lines.join("\n");
 	}
 
-	/** Zero the per-session caches; the balance itself is a property of the account. */
+	/** Zero the per-session caches; the account's balance and windows are the account's own. */
 	function reset() {
 		state.spendCache = { key: undefined, value: undefined };
+		state.samples = [];
 	}
 
 	pi.on("session_start", async (_event, ctx) => reconcile(ctx));
@@ -362,5 +474,5 @@ export function installBalance(pi, shell) {
 		},
 	});
 
-	return { segment, section, reset, state };
+	return { segment, windowSegment, section, reset, state };
 }

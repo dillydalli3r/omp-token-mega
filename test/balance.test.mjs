@@ -9,15 +9,25 @@
  *   node test/balance.test.mjs
  */
 
-import { checks, GEMINI_MODEL, makeHost, OPENCODE_MODEL, tick, UNCACHED_MODEL, UNPRICED_MODEL, withConfig } from "./harness.mjs";
+import { checks, GEMINI_MODEL, makeHost, OPENCODE_MODEL, tick, UNCACHED_MODEL, UNPRICED_MODEL, WINDOW_PAYLOAD, withConfig } from "./harness.mjs";
 import { LITHOS_BASE_URL } from "../src/lithosai.js";
 import { money } from "../src/measure.js";
 
 const { expect, done } = checks();
 
 let fetches = 0;
-globalThis.fetch = async () => {
+let usageFetches = 0;
+globalThis.fetch = async (url) => {
 	fetches += 1;
+	// The account surface is two routes now: DeepSeek's balance, and OpenCode Go's quota
+	// windows. The stub answers whichever one was called, so a suite can tell them apart.
+	if (String(url).includes("/usage")) {
+		usageFetches += 1;
+		return new Response(JSON.stringify(WINDOW_PAYLOAD), {
+			status: 200,
+			headers: { "content-type": "application/json" },
+		});
+	}
 	return new Response(
 		JSON.stringify({
 			is_available: true,
@@ -182,27 +192,41 @@ await withConfig({}, async () => {
 
 // The tag names the account the session is spending, so an OpenCode Go or Google session
 // draws its own where a DeepSeek session draws `DS` — the same figures after it, and the
-// same absence of a balance figure, because DeepSeek's is the only endpoint this plugin
-// reads. Each is priced from the branch the same way, so the `used $` figure is identical.
-for (const [label, model, tag, title] of [
-	["opencode-go", OPENCODE_MODEL, "GO", "OpenCode Go"],
-	["google", GEMINI_MODEL, "GEMINI", "Google Gemini"],
+// same absence of a balance figure, because DeepSeek's is the only balance endpoint this
+// plugin reads. Each is priced from the branch the same way, so the `used $` figure is
+// identical. Where they part company is the poll: OpenCode Go publishes quota windows and
+// Google publishes nothing this plugin reads, so one arms a timer and the other must not.
+for (const [label, model, tag, title, windows] of [
+	["opencode-go", OPENCODE_MODEL, "GO", "OpenCode Go", true],
+	["google", GEMINI_MODEL, "GEMINI", "Google Gemini", false],
 ]) {
 	await withConfig({}, async () => {
 		fetches = 0;
-		const host = await makeHost({ model });
+		usageFetches = 0;
+		const host = await makeHost({ model, modelRegistry: MODEL_REGISTRY });
 		host.ctx.sessionManager.getBranch = () => BRANCH;
 		await host.start();
 		await tick();
 
 		expect(`${label}: the row draws its own tag and the branch's cost`, host.row?.includes(`${tag} \u00b7 used $1.00 (main $0.84 + agents $0.16)`), host.row);
-		expect(`${label}: no balance request`, fetches === 0, fetches);
-		expect(`${label}: no poll timer`, host.timers.size === 0, host.timers.size);
+		expect(`${label}: ${windows ? "no balance request" : "no request at all"}`, usageFetches === (windows ? 1 : 0) && fetches === usageFetches, { fetches, usageFetches });
+		expect(`${label}: ${windows ? "the window route is polled" : "no poll timer"}`, windows ? usageFetches === 1 && host.timers.size === 1 : host.timers.size === 0, { fetches, usageFetches, timers: host.timers.size });
+		if (windows) {
+			expect(
+				"opencode-go: the row carries every window as a percent",
+				/5h 12%/.test(host.row ?? "") && /7d 61%/.test(host.row ?? "") && /monthly 88%/.test(host.row ?? ""),
+				host.row,
+			);
+		}
 
 		const tool = host.tools.get("account_balance");
 		const report = String((await tool.execute("1", {}, undefined, undefined, host.ctx)).content[0].text);
 		expect(`${label}: the section is titled for the account`, report.startsWith(`### ${title} account`), report.slice(0, 120));
-		expect(`${label}: it says the account surface is not polled`, report.includes(`not polled by this plugin for \`${model.provider}\``), report.slice(0, 700));
+		if (windows) {
+			expect("opencode-go: the section reports every window", report.includes("### Usage windows") && report.includes("| 5 Hour | 12% |") && report.includes("| Monthly | 88% |"), report.slice(0, 900));
+		} else {
+			expect(`${label}: it says the account surface is not polled`, report.includes(`not polled by this plugin for \`${model.provider}\``), report.slice(0, 700));
+		}
 		expect(`${label}: the same session table as DeepSeek`, report.includes("| main | 0.8400 | 100,000 | 10,000 | 20,000 | 1 |"), report);
 		await host.shutdown();
 	});

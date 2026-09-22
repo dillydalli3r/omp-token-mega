@@ -2,24 +2,29 @@
 
 One plugin for the [oh-my-pi](https://omp.sh) token economy: it shrinks a tool result
 *before it is ever sent*, meters the prefix cache on every model whose provider reports one,
-names the one omp setting that keeps that prefix byte-stable, reports the account behind the
-active model with the session's USD cost, and adds the [LithosAI](#lithosai) provider with its
-speed and rate-limit metrics — behind **one command, one settings menu and one status row**.
+names the omp settings that keep that prefix byte-stable and cheap — and, through
+[`/mega tune`](#tuning), writes them as session overrides — reports the account behind the
+active model with its quota windows and the session's USD cost, and adds the
+[LithosAI](#lithosai) provider with its speed and rate-limit metrics — behind **one command,
+one settings menu and one status row**.
 
 ```
 cache 92% · 120k cached · $0.84 saved · off-peak, peak 2026-09-20 21:00–2026-09-21 00:00 EDT · DS ¥11.48 · used $1.27 · TS -28.8 KB (~7.4k tok) · 1/1 results
+5h 12% ↻4h12m · 7d 61% ↻2d20h · monthly 88% · GO · used $1.27 · TS -12.3 KB (~3.1k tok)
 cache 49% · 19k cached · $0.04 saved · LITHOS · used $0.06 · TS ready
 cache 71% · 44k cached · $0.02 saved · ⚠ append-only off · GEMINI · used $0.31 · TS ready
 ```
 
-That is the row on a DeepSeek session, a LithosAI session and a Google Gemini session
-respectively: one layout on all three, carrying the same metrics under the same names — hit
-rate, cached tokens, USD saved, USD used — with only the provider-specific parts differing.
-The tag names the account being spent (`DS`, `LITHOS`, `GEMINI`, and `GO`, `ZEN`, `CLAUDE`,
-`OAI`, `OR` for the rest), and DeepSeek then contributes the peak/off-peak tariff and the
-polled balance figure (`DS ¥11.48`); LithosAI publishes no balance and bills flat rates, so
-its row stops after the tag, and a Gemini row carries the warning that nothing is holding its
-prefix still (see [Prefix stability](#prefix-stability)). LithosAI's speed and per-minute budgets
+That is the row on a DeepSeek session, an OpenCode Go session, a LithosAI session and a
+Google Gemini session respectively: one layout on all four, carrying the same metrics under
+the same names — hit rate, cached tokens, USD saved, USD used — with only the
+provider-specific parts differing. The tag names the account being spent (`DS`, `LITHOS`,
+`GEMINI`, and `GO`, `ZEN`, `CLAUDE`, `OAI`, `OR` for the rest); the `window` group is the
+quota headroom a metered provider publishes, which is the figure that decides whether a
+session can still bill; DeepSeek then contributes the peak/off-peak tariff and the polled
+balance figure (`DS ¥11.48`); LithosAI publishes no balance and bills flat rates, so its row
+stops after the tag, and a Gemini row carries the warning that nothing is holding its prefix
+still (see [Prefix stability](#prefix-stability)). LithosAI's speed and per-minute budgets
 are measured and reported in `/mega lithos`, not as extra row segments — the row is the same
 row on every provider. omp renders
 **one footer line per status key** (`status-line/component.ts` pushes a line per hook status),
@@ -49,7 +54,7 @@ Anthropic, OpenAI, OpenRouter — the live system prompt and tool catalogue are 
 each turn, and a prefix cache can read that as a change: a prefix is cached from the front, so
 one re-serialized line early in it costs the hits of everything behind it.
 
-This plugin reports that state and never changes it. It appears:
+This plugin reports that state, and — on request — changes it. It appears:
 
 - on the row, as a yellow `⚠ append-only off` part, drawn only when the plugin and the cache
   accounting are on, the live model is cache capable, omp's auto rule does not cover its
@@ -61,11 +66,12 @@ This plugin reports that state and never changes it. It appears:
   `auto` until something stores one — carrying the reason and
   `omp config set provider.appendOnlyContext on`.
 
-The command is printed, never run. Writing an omp setting from a plugin would change how every
-other plugin's requests are serialized, so the setting is the user's to make; and
-`cache.appendOnly=false` suppresses the advice and the row part without stopping the
-measurement, because a user who turned it off asked not to be told again — `/mega cache` still
-reports the drift it causes.
+`/mega tune` is the one thing that writes it, and it writes a **runtime override**: the setting
+changes for this process, `config.yml` is untouched, and `/mega tune revert` puts it back.
+`/mega tune save` is the explicit request to write it to your config instead. The advice is
+still printed with the exact `omp config set` line for a user who would rather make the change
+themselves, and `cache.appendOnly=false` still suppresses the advice and the row part without
+stopping the measurement.
 
 Every feature is independent: turn one off and the others keep working, drop a segment from
 `statusSegments` and the rest of the row is untouched.
@@ -73,9 +79,8 @@ Every feature is independent: turn one off and the others keep working, drop a s
 | Feature | What it does | Scope |
 | --- | --- | --- |
 | **Token saving** | Reduces a tool result before it is first sent: terminal escapes, identical line runs, over-long lines, pretty-printed JSON, byte-identical repeats, over-budget results elided behind `artifact://` handles. | Every provider |
-| **Cache accounting** | Measures the prefix cache: hit rate, cached tokens, USD saved, the peak/off-peak window the tariff is in (named and tinted on the row), miss attribution, tool-catalogue drift, subagent shards, and whether omp is holding the prefix still. Read-only on the request path. | Every model whose provider reports cached input tokens, or whose card prices a cache read |
-| **LithosAI** | Registers the LithosAI provider (models, `/login`, usage reporting) and measures observed tokens/second plus the per-minute request and token budgets from response headers. | LithosAI |
-| **Balance** | The account behind the active model and the session cost table split into main session and subagents, plus the prefix-cache hit rate that produced it. DeepSeek's balance is polled; LithosAI publishes none, so its section reports the credit state the wire shows and names the console; every other model the cache accounting can measure gets the tag, this session's spend, and the fact that its account surface is not polled here. | Every model the cache accounting can measure |
+| **Cache accounting** | Measures the prefix cache: hit rate, cached tokens, USD saved, the peak/off-peak window the tariff is in (named and tinted on the row), miss attribution, tool-catalogue drift, subagent shards, and whether omp is holding the prefix …
+| **LithosAI** | Registers the LithosAI provider (models, `/login`, usage reporting) and measures observed tokens/second plus the per-minute request and token budgets from response headers. | LithosAI || **Balance** | The account behind the active model and the session cost table split into main session and subagents, plus the prefix-cache hit rate that produced it. DeepSeek's balance is polled; LithosAI publishes none, so its section reports the credit state the wire shows and names the console; every other model the cache accounting can measure gets the tag, this session's spend, and the fact that its account surface is not polled here. | Every model the cache accounting can measure |
 
 ## The one rule
 
@@ -109,6 +114,20 @@ Or straight from the repository:
 omp plugin install github:dillydalli3r/omp-token-mega
 ```
 
+On Windows, `install.bat` in the repository root does the same and then verifies: it checks
+that `omp` and `bun` are on `PATH` (omp installs plugins by running `bun install`), installs,
+and confirms `omp plugin list` and `omp plugin config list` both see the package, so a failed
+install cannot look like a successful one.
+
+```bat
+install.bat                      install from github:dillydalli3r/omp-token-mega
+install.bat local                install this working copy instead (a symlink; refused
+                                 unless this shell can create one - Developer Mode or elevated)
+install.bat force                reinstall or upgrade over an existing install
+install.bat nopause              never wait for a keypress when finished
+install.bat help
+```
+
 Then start a new omp session (extension modules are imported at session start; a hot-plugged
 plugin needs one restart). Check what omp sees:
 
@@ -128,7 +147,7 @@ One command, `/mega`:
 | `/mega` | The menu: report, status, settings, preset, audit, cache, LithosAI, balance, reset. |
 | `/mega report` | One report: token saving, prefix cache, LithosAI, account — in that order. |
 | `/mega status` | The status row, as plain text and untinted, for modes where the widget is not drawn. |
-| `/mega config` | All 36 settings, grouped, with the layer that supplied each (`default`, `preset:<name>`, `global`, `project`, `env`). |
+| `/mega config` | All 38 settings, grouped, with the layer that supplied each (`default`, `preset:<name>`, `global`, `project`, `env`). |
 | `/mega config reset [key] [global\|project]` | Drop stored settings so defaults and presets apply again; names any env var still overriding. |
 | `/mega menu` | The same menu, spelled out (a bare `/mega` opens it too). |
 | `/mega preset [off\|conservative\|balanced\|aggressive\|max]` | Show or switch the token-saving bundle. |
@@ -243,6 +262,70 @@ is gated by the floor and sits behind every cause the client *can* act on: it is
 when the floor is above zero, the request billed something, and its billed input is under the
 floor and no more specific cause applies. Set `cache.minPrefixTokens` to `0` to stop labelling
 short prefixes and let them read as ordinary misses, or raise it to your provider's real floor.
+
+## Usage windows
+
+Cost is not the only thing that stops a long session; a spent quota is. OpenCode Go meters the
+account with three windows — 5-hour rolling, weekly, monthly — and publishes them at
+`GET https://opencode.ai/zen/go/v1/usage`: a percent used, a status (`ok` or `rate-limited`)
+and the instant each resets. Hit the ceiling on the rolling window and requests stop until it
+rolls, whatever credit is left on the account. That is the number a session plan has to be
+built around, so it is read, drawn and projected:
+
+- **On the row**, as the `window` group: `5h 12% ↻4h12m · 7d 61% ↻2d20h`, yellow from
+  `window.warnAt` percent (80 by default) and red once the provider is refusing requests. The
+  group is dropped when the provider publishes no windows, so a Google or Anthropic session's
+  row is exactly what it was.
+- **In `/mega balance`**, as `### Usage windows`: one row per window with the used percentage,
+  the status and the reset on **your** clock plus the countdown, then the advice.
+- **With a burn rate.** Every refresh samples the shortest window, so the section can say
+  `burning 6.2%/h — exhaustion in 4h10m, ahead of the reset in 5h` and name the action: pace
+  requests, switch model, or wait for the reset. A window whose reset lands before the
+  projected exhaustion is reported that way instead of being given a bogus ETA.
+
+The route is the same one omp's own usage provider reads, with the same credential the model's
+requests carry (`x-opencode-session` included), polled on the balance timer, cached, and kept
+on a failure: a 401 or a 500 leaves the last good report in place rather than blanking the
+row. `window.enabled=false` stops the request entirely.
+
+## Tuning
+
+Everything above measures. This is the part that acts on what it measures — via
+`pi.pi.settings`, omp's live `Settings` singleton, which is the only handle a plugin has on
+core settings.
+
+`/mega tune` prints the plan for the live model: every knob the plugin would change, its live
+value, the recommendation, and the reason. `/mega tune apply` writes them as **runtime
+overrides** — the setting changes for this process, `config.yml` is untouched, and
+`/mega tune revert` takes it back. `/mega tune save` is the explicit request to persist them
+instead. Nothing is ever written to a knob **you** configured: it is reported as yours, with
+the exact `omp config set …` line, and only `force` re-offers it.
+
+| Knob | Recommended | Why |
+| --- | --- | --- |
+| `provider.appendOnlyContext` | `on`, when the model is cache capable but omp's own auto rule does not cover its provider | a cache read bills a fraction of a miss — on DeepSeek-class routes 2% — and without append-only the system prompt and tool block are re-serialized every request, so the prefix never matches |
+| `display.cacheMissMarker` | `true` on a cache-capable model | a miss is the most expensive event in the session; an invisible one cannot be diagnosed |
+| `tools.artifactSpillThreshold` | sized to the live context window (`contextWindow / 8000`, clamped 8–50 KB) | on a large window a 50 KB inline result is paid for again on every later request |
+| `retry.waitForUsageReset` | `true` | a request that hits a 5-hour or weekly limit sleeps until the reset instead of failing, so a long run finishes without a human restarting it |
+| `todo.remindersMax` | `6` (omp's default is 3) | omp nudges an agent that stops with an unfinished todo list; the extra nudges are cheap turns that finish the work instead of leaving it to be redone |
+| `task.softRequestBudget` | `400` (omp's default is 200, force-stop at 1.5×) | a subagent stopped mid-investigation pays for its requests twice when a fresh child starts over |
+| `bash.autoBackground.thresholdMs` | `30000` (omp's default is 60000) | a slow command is backgrounded a minute earlier, so the turn stops waiting on it |
+
+The plan is advice where a knob is a behaviour choice rather than a token lever. Two of those
+rows are worth reading before the table:
+
+- **Where delegated work runs.** A `task` subagent bills its own model, and omp delegates by
+  default, so the model a child runs on is a first-order cost decision. The plan names the
+  cheapest model on the live provider that can hold the work (a real price, cheaper output, at
+  least a 100k window) and the ratio against the current one — on the gateway this plugin was
+  built for, a third of the output price — with the `task.agentModelOverrides` command and a
+  pointer to omp's own `/agents` hub, which is where that choice belongs.
+- **A model role that pins a thinking effort** (`opencode-go/deepseek-v4.1-flash:max`). On a
+  route that requires reasoning to be replayed — DeepSeek's, where the gateway declares
+  `requires-reasoning-content-for-tool-calls` — the thinking text is billed as **input** on every
+  subsequent tool-call step, so a pinned `max` pays for the same reasoning again and again while
+  `auto` hands the decision to omp's own classifier. The plugin prints the command; it will not
+  change your model choice for you.
 
 ## LithosAI
 
@@ -375,11 +458,13 @@ Prefix cache hit rate: **17%** (1/1 requests).
 `/mega audit` answers the one question the per-feature sections do not: where this session's
 input tokens actually go, and which of omp's own knobs is set wrong for this model. It reads
 the live session (`pi.getAllTools()`, `ctx.getContextUsage()` — exact and free) and omp's
-settings files, parsed with a deliberately small dotted-key reader because the extension API
-exposes no settings surface; a key the reader cannot see falls back to the documented default,
-and the audit prints the value it read next to the one it recommends. After the request
-envelope, the largest system-prompt blocks and the largest tool schemas, it prints a
-recommendation list. Two of those rows are about the cache:
+settings files, parsed with a deliberately small dotted-key reader, so its view is exactly what
+`config.yml` says and nothing else; a key the reader cannot see falls back to the documented
+default, and the audit prints the value it read next to the one it recommends. After the
+request envelope, the largest system-prompt blocks and the largest tool schemas, it prints a
+recommendation list. `/mega tune` reads the *live* settings instead — the same values omp is
+acting on, including a runtime override — and is the one place those recommendations can be
+applied. Two of the audit's rows are about the cache:
 
 - **`provider.appendOnlyContext`** — appears when the live model is cache capable, the setting
   is not already `on` (it reads `auto` until something stores a value), and omp's auto rule does
@@ -411,6 +496,7 @@ nothing.
 | Cache accounting | `cache.enabled`, `cache.minPrefixTokens`, `cache.appendOnly`, `cache.subagents`, `cache.idleTtlMinutes`, `cache.retentionDays` |
 | LithosAI | `lithos.enabled`, `lithos.baseUrl`, `lithos.inputPerMillion`, `lithos.outputPerMillion`, `lithos.cachedPerMillion` |
 | Balance | `balance.enabled`, `balance.ttlSeconds` |
+| Usage windows | `window.enabled`, `window.warnAt` |
 
 Two of the `cache.*` keys are about the prefix rather than the arithmetic, and neither changes
 what is measured: `cache.minPrefixTokens` (1024) is the floor under which a miss is labelled
@@ -420,9 +506,11 @@ stability block. Turn it off and the stability block still says whether omp is h
 prefix still; it just stops telling you to change it.
 
 `statusSegments` is the row's whole layout: a comma-separated list drawn from `cache`,
-`balance`, `token` (`"cache,balance,token"` by default). Order is display
-order, unknown names are ignored, and a segment that does not fit `statusMaxChars` is dropped
-whole — a row clipped mid-number reads as a different number than the one it came from.
+`window`, `balance`, `token` (`"cache,window,balance,token"` by default). Order is display
+order, unknown names are ignored, a group whose feature has nothing to report (a provider that
+publishes no windows, a model the accounting cannot meter) contributes nothing, and a segment
+that does not fit `statusMaxChars` is dropped whole — a row clipped mid-number reads as a
+different number than the one it came from.
 
 ```bash
 # examples
@@ -455,10 +543,11 @@ print, RPC and ACP modes the same content is printed as text with the exact shel
   `/models`, `/models/{author}/{slug}` and `/chat/completions` — so the section reports the
   credit state the wire shows and names the console rather than calling a URL that does not
   exist. Budgets come from the headers on real traffic; usage comes from each response.
-- **Writing omp's own settings.** `provider.appendOnlyContext` is printed as a command and
-  never applied: it decides how every plugin's requests are serialized, so it belongs to the
-  user, and the audit row, the stability block and the row part all say so. The plugin writes
-  only its own keys, through `omp plugin config`.
+- **Writing omp's own settings unasked.** The plugin writes them in exactly one place,
+  `/mega tune`, and only after you run it: as runtime overrides by default, with a receipt that
+  `/mega tune revert` replays, and never over a value you configured yourself. Everything else —
+  the audit rows, the stability block, the row part — prints the command and leaves the choice
+  to you. Its own keys are written through `omp plugin config`.
 
 ## Migrating from the three plugins
 
@@ -496,6 +585,26 @@ unexplained miss. The cache accounting and the account section now speak for eve
 cache-capable model rather than a fixed pair of providers, so a Gemini, Anthropic, OpenAI,
 OpenRouter or OpenCode session that 1.x left alone now draws a row segment, a cache section and
 a cost table — the same figures, computed the same way, on a session that previously had none.
+
+## Upgrading from 2.x
+
+Two features arrive, and one default changes:
+
+- **`/mega tune`** — the first thing this plugin writes into omp itself, and only when asked:
+  session overrides (runtime, `config.yml` untouched) for the knobs that decide what a session
+  costs and whether it finishes, with `/mega tune revert` to undo them and `force` to re-offer
+  a knob you configured yourself.
+- **Usage windows** — a new `window` row group and `### Usage windows` section for providers
+  that meter the account (OpenCode Go's 5-hour, weekly and monthly limits), with the burn rate
+  and where it projects exhaustion. The polling rides the balance timer, so an OpenCode Go
+  session now makes one request per `balance.ttlSeconds` where it previously made none;
+  `window.enabled=false` stops it.
+- **`statusSegments` now defaults to `"cache,window,balance,token"`.** A stored list keeps
+  whatever it says — add `window` to it to see the new group, or leave it out. The group
+  contributes nothing on a provider that publishes no windows, so a Gemini or Anthropic row is
+  unchanged either way.
+- **`balance` now reads as the account group**, reporting windows where they exist and the
+  balance where one does; `/mega balance` and the `account_balance` tool return both.
 
 ## Credits
 

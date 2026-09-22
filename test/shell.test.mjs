@@ -10,7 +10,7 @@
  *   node test/shell.test.mjs
  */
 
-import { checks, DEEPSEEK_MODEL, makeHost, OPENCODE_MODEL, SCHEDULED_MODEL, STATUS_KEY, tick, withConfig } from "./harness.mjs";
+import { checks, createFakeSettings, DEEPSEEK_MODEL, makeHost, OPENCODE_MODEL, SCHEDULED_MODEL, STATUS_KEY, tick, withConfig } from "./harness.mjs";
 import { CONFIG_KEYS, CONFIG_SCHEMA, KEY_GROUPS, STATUS_SEGMENTS, statusSegmentNames } from "../src/config.js";
 import { composeRow, renderRow, TINTS } from "../src/status.js";
 
@@ -417,6 +417,75 @@ await withConfig({}, async () => {
 	const text = host.rendered;
 	expect("menu: without a dialog surface it lists the keys", text.includes("Effective configuration") && text.includes("lithos.baseUrl"), text.length);
 	expect("menu: and the shell commands that change them", text.includes("omp plugin config set @dillydalli3r/omp-token-mega"), text.slice(0, 300));
+});
+
+// The tuner is the one place the plugin writes an omp setting, so what it writes, where it
+// writes it and what it leaves alone are the contract this suite pins: session overrides by
+// default (nothing the user owns is touched), `set` only when the user asks for a saved
+// change, and a knob a human configured is advice with the command to change it.
+await withConfig({}, async () => {
+	const host = await makeHost({
+		model: { ...OPENCODE_MODEL, contextWindow: 1_000_000 },
+		coreSettings: createFakeSettings(),
+		availableModels: [
+			{ ...OPENCODE_MODEL, contextWindow: 1_000_000 },
+			{ provider: "opencode-go", id: "muse-spark-1.3-contributor", cost: { input: 0.1, output: 0.2, cacheRead: 0.002, cacheWrite: 0 }, contextWindow: 1_048_576 },
+		],
+	});
+	await host.start();
+	await tick();
+	const command = host.commands.get("mega");
+
+	await command.handler("tune", host.ctx);
+	const plan = host.rendered;
+	expect("tune: the plan names the append-only knob for a gateway DeepSeek route", plan.includes("provider.appendOnlyContext"), plan.slice(0, 400));
+	expect("tune: the plan explains the dollars, not the setting", plan.includes("2% of a miss"), plan.slice(0, 600));
+	expect("tune: the plan offers the apply command", plan.includes("/mega tune apply"), plan.slice(-400));
+	expect("tune: the plan routes delegated work to the cheaper sibling", plan.includes("opencode-go/muse-spark") && plan.includes("3.0x cheaper"), plan.slice(-700));
+	expect("tune: reading the plan writes nothing", host.coreSettings.calls.length === 0, host.coreSettings.calls);
+
+	await command.handler("tune apply", host.ctx);
+	const applied = host.coreSettings.calls.filter((call) => call.method === "override");
+	expect("tune apply: the knob is written as a runtime override", applied.some((call) => call.path === "provider.appendOnlyContext" && call.value === "on"), host.coreSettings.calls);
+	expect("tune apply: nothing is persisted", host.coreSettings.calls.every((call) => call.method !== "set"), host.coreSettings.calls);
+	expect("tune apply: the receipt says what changed", host.notified.includes("provider.appendOnlyContext"), host.notified.slice(-200));
+
+	await command.handler("tune apply", host.ctx);
+	expect("tune apply is idempotent: the second run writes nothing", host.coreSettings.calls.filter((call) => call.method === "override").length === applied.length, host.coreSettings.calls);
+
+	await command.handler("tune revert", host.ctx);
+	expect("tune revert: the override is cleared", host.coreSettings.calls.some((call) => call.method === "clearOverride" && call.path === "provider.appendOnlyContext"), host.coreSettings.calls);
+	expect("tune revert: the knob reads as untouched again", host.coreSettings.get("provider.appendOnlyContext") === undefined, host.coreSettings.get("provider.appendOnlyContext"));
+
+	await command.handler("tune save", host.ctx);
+	expect("tune save: the knob is persisted instead", host.coreSettings.calls.some((call) => call.method === "set" && call.path === "provider.appendOnlyContext" && call.value === "on"), host.coreSettings.calls);
+	await host.shutdown();
+});
+
+await withConfig({}, async () => {
+	const settings = createFakeSettings({ initial: { "provider.appendOnlyContext": "off" }, configured: ["provider.appendOnlyContext"] });
+	const host = await makeHost({ model: OPENCODE_MODEL, coreSettings: settings });
+	await host.start();
+	await tick();
+	await host.commands.get("mega").handler("tune", host.ctx);
+
+	expect("tune: a knob the user configured is not in the plan's changes", host.rendered.includes("yours") || host.rendered.includes("pinned"), host.rendered.slice(-500));
+	expect("tune: and it carries the exact command to change it", host.rendered.includes("omp config set provider.appendOnlyContext on"), host.rendered.slice(-500));
+	await host.commands.get("mega").handler("tune apply", host.ctx);
+	expect("tune: applying never overwrites the user's own value", settings.get("provider.appendOnlyContext") === "off", settings.overrides);
+	expect("tune: nothing was written for it", settings.overrides["provider.appendOnlyContext"] === undefined, settings.overrides);
+	await host.shutdown();
+});
+
+// The report has to explain the whole plugin in one command, and the row has to carry the
+// account's headroom — a quota window that is spent stops the work regardless of credit.
+await withConfig({}, async () => {
+	const host = await makeHost({ model: { ...OPENCODE_MODEL, contextWindow: 1_000_000 }, modelRegistry: { getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "k" }) } });
+	await host.start();
+	await tick();
+	expect("row: the usage-window group is part of the default row", statusSegmentNames({ statusSegments: CONFIG_SCHEMA.statusSegments.default }).includes("window"));
+	expect("row: every window group name is a documented settings group", STATUS_SEGMENTS.every((name) => CONFIG_KEYS.some((key) => key === name || key.startsWith(`${name}.`))), STATUS_SEGMENTS);
+	await host.shutdown();
 });
 
 done();

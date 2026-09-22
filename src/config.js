@@ -44,7 +44,7 @@ import { LITHOS_BASE_URL } from "./lithosai.js";
 const NOISY_TOOLS = "bash,grep,glob,web_search,eval,mcp__*";
 
 /** The groups a status-row segment can come from, in the default display order. */
-export const STATUS_SEGMENTS = ["cache", "balance", "token"];
+export const STATUS_SEGMENTS = ["cache", "window", "balance", "token"];
 
 export const CONFIG_SCHEMA = {
 	enabled: {
@@ -69,7 +69,7 @@ export const CONFIG_SCHEMA = {
 	},
 	statusSegments: {
 		type: "string",
-		default: "cache,balance,token",
+		default: "cache,window,balance,token",
 		env: "OMP_TOKEN_MEGA_STATUS_SEGMENTS",
 		description: `Which groups the row shows, in order: ${STATUS_SEGMENTS.join(", ")}. Unknown names are ignored; an empty list hides the row.`,
 	},
@@ -234,7 +234,7 @@ export const CONFIG_SCHEMA = {
 		default: true,
 		env: "OMP_TOKEN_MEGA_CACHE_APPEND_ONLY",
 		description:
-			"Report whether omp's append-only context mode is on for the live provider, and name the one command that turns it on (`omp config set provider.appendOnlyContext on`) where it is not. Read-only: the plugin never writes omp settings itself, it only tells you the setting exists.",
+			"Report whether omp's append-only context mode is on for the live provider, where it is not, and what it costs to leave it off. `/mega tune` is the one place that writes it — as a session override, never to your config, unless you ask for that — and `/mega tune revert` takes it back.",
 	},
 	"cache.subagents": {
 		type: "boolean",
@@ -312,6 +312,23 @@ export const CONFIG_SCHEMA = {
 		env: "OMP_TOKEN_MEGA_BALANCE_TTL_SECONDS",
 		description: "How long a fetched balance is reused before the poller refreshes it.",
 	},
+
+	"window.enabled": {
+		type: "boolean",
+		default: true,
+		env: "OMP_TOKEN_MEGA_WINDOW_ENABLED",
+		description:
+			"Poll the provider's quota windows and show the headroom left in them, in the row and in the report. Today that is OpenCode Go's 5-hour, weekly and monthly windows (`GET /v1/usage`), the figures that decide whether a session can still bill. Off means no request is ever made.",
+	},
+	"window.warnAt": {
+		type: "number",
+		default: 80,
+		min: 50,
+		max: 99,
+		env: "OMP_TOKEN_MEGA_WINDOW_WARN_AT",
+		description:
+			"Percent of a quota window at which the row turns yellow and the report starts advising a slower pace. Reaching 100%, or the provider answering `rate-limited`, turns it red: the session is about to stop, not slow down.",
+	},
 };
 
 export const CONFIG_KEYS = Object.keys(CONFIG_SCHEMA);
@@ -323,6 +340,7 @@ export const KEY_GROUPS = [
 	{ id: "cache", label: "Cache accounting", prefix: "cache.", keys: CONFIG_KEYS.filter((key) => key.startsWith("cache.")) },
 	{ id: "lithos", label: "LithosAI", prefix: "lithos.", keys: CONFIG_KEYS.filter((key) => key.startsWith("lithos.")) },
 	{ id: "balance", label: "Balance", prefix: "balance.", keys: CONFIG_KEYS.filter((key) => key.startsWith("balance.")) },
+	{ id: "window", label: "Usage windows", prefix: "window.", keys: CONFIG_KEYS.filter((key) => key.startsWith("window.")) },
 ];
 
 export const PRESET_NAMES = CONFIG_SCHEMA["token.preset"].values;

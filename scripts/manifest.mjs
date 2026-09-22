@@ -36,21 +36,21 @@ for (const [key, schema] of Object.entries(CONFIG_SCHEMA)) {
 
 const pkg = {
 	name: "@dillydalli3r/omp-token-mega",
-	version: "2.0.0",
+	version: "3.0.0",
 	description:
-		"One oh-my-pi plugin for the token economy: prefix-cache accounting and advice for every provider whose models report cached input tokens (DeepSeek, OpenCode Go, Google Gemini, LithosAI, Anthropic, OpenAI), a cache-safe reducer that shrinks a tool result before it is first sent, the account behind the active model with the session's USD cost, and the LithosAI provider with published rates, measured tokens/second and rate-limit metrics. One command, one settings menu, one status row.",
+		"One oh-my-pi plugin for the token economy: prefix-cache accounting and advice for every provider whose models report cached input tokens (DeepSeek, OpenCode Go, Google Gemini, LithosAI, Anthropic, OpenAI), a cache-safe reducer that shrinks a tool result before it is ever sent, a governor that applies the core settings which keep that prefix byte-stable and cheap (session overrides, revertible), and the account behind the model — balance, quota windows with burn rate, and this session's USD cost — on one status row.",
 	license: "MIT",
 	author: "dillydalli3r",
 	type: "module",
 	repository: { type: "git", url: "git+https://github.com/dillydalli3r/omp-token-mega.git" },
 	homepage: "https://github.com/dillydalli3r/omp-token-mega",
 	bugs: { url: "https://github.com/dillydalli3r/omp-token-mega/issues" },
-	keywords: ["omp", "oh-my-pi", "tokens", "cost", "prefix-cache", "prompt-cache", "kv-cache", "cache-hit-rate", "cache-accounting", "append-only-context", "tool-output", "compression", "dedupe", "context", "subagents", "balance", "spend", "statusline", "tui", "lithosai", "deepseek", "gemini", "anthropic", "openai", "opencode"],
+	keywords: ["omp", "oh-my-pi", "tokens", "cost", "prefix-cache", "prompt-cache", "kv-cache", "cache-hit-rate", "cache-accounting", "append-only-context", "tool-output", "compression", "dedupe", "context", "subagents", "balance", "spend", "statusline", "tui", "lithosai", "deepseek", "gemini", "anthropic", "openai", "opencode", "usage-windows", "rate-limit", "quota", "tuning", "cost-optimization", "deepseek-v4", "budget"],
 	omp: { extensions: ["./src/index.js"], settings },
 	files: ["src", "scripts", "test", "README.md", "LICENSE", "CREDITS.md"],
 	scripts: {
-		check: "node --check src/index.js && node --check src/config.js && node --check src/status.js && node --check src/report.js && node --check src/menu.js && node --check src/token.js && node --check src/cache.js && node --check src/balance.js && node --check src/balance-client.js && node --check src/compress.js && node --check src/dedupe.js && node --check src/measure.js && node --check src/audit.js && node --check src/stats.js && node --check src/prefix.js && node --check src/deepseek.js && node --check src/repair.js && node --check src/usage.js && node --check src/lithosai.js && node --check src/model.js",
-		test: "node test/token.test.mjs && node test/cache.test.mjs && node test/lithosai.test.mjs && node test/balance.test.mjs && node test/shell.test.mjs",
+		check: "node --check src/index.js && node --check src/config.js && node --check src/status.js && node --check src/report.js && node --check src/menu.js && node --check src/token.js && node --check src/cache.js && node --check src/balance.js && node --check src/tune.js && node --check src/window.js && node --check src/balance-client.js && node --check src/compress.js && node --check src/dedupe.js && node --check src/measure.js && node --check src/audit.js && node --check src/stats.js && node --check src/prefix.js && node --check src/deepseek.js && node --check src/repair.js && node --check src/usage.js && node --check src/lithosai.js && node --check src/model.js",
+		test: "node test/token.test.mjs && node test/cache.test.mjs && node test/lithosai.test.mjs && node test/balance.test.mjs && node test/shell.test.mjs && node test/tune.test.mjs && node test/window.test.mjs",
 		manifest: "node scripts/manifest.mjs",
 	},
 	engines: { node: ">=18" },
