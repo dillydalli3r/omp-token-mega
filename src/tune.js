@@ -141,7 +141,7 @@ export const KNOBS = [
 		key: "provider.appendOnlyContext",
 		category: "cache",
 		label: "Append-only context",
-		why: "a cache read bills 2% of a miss, and without append-only the system prompt and tool block are re-serialized every request, so the prefix never matches.",
+		why: "a cache read bills 2% of a miss, and without append-only the leading block — system prompt, tool catalogue — is rebuilt on every request, so any input that shifts under it costs the hits of everything behind it. Insurance, priced by the hit rate the cache section already measures.",
 		recommend({ model }) {
 			if (!cacheCapable(model)) return undefined;
 			// omp already turns this on by itself for DeepSeek, the local engines, loopback and

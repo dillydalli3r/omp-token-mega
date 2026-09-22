@@ -50,11 +50,16 @@ omp turns that mode on by itself only where its rule covers the model — `deeps
 engines (`ollama`, `ollama-cloud`, `lm-studio`, `llama.cpp`), a model served over loopback,
 RFC1918 or `.local`, and a route whose compat config sets `supportsStore`. On **every other
 provider** — OpenCode Go and OpenCode Zen, Google Gemini, LithosAI's remote endpoint,
-Anthropic, OpenAI, OpenRouter — the live system prompt and tool catalogue are re-serialized
-each turn, and a prefix cache can read that as a change: a prefix is cached from the front, so
-one re-serialized line early in it costs the hits of everything behind it.
+Anthropic, OpenAI, OpenRouter — the leading block is rebuilt per request from the live system
+prompt, tool catalogue and message log. A prefix is cached from the front, so one line that
+comes out different early in it costs the hits of everything behind it. Rebuilding is not the
+same as changing — a session whose inputs happen to be stable hits just as well — which is why
+this is *insurance*, and why the hit rate the cache accounting measures is what says whether it
+was needed. On a measured session on this plugin's own gateway, the cache hit rate sat at 99.6%
+of input tokens with append-only off, so the honest expectation is not "this doubles your
+savings" but "the turns where something moved stop costing the whole prefix".
 
-This plugin reports that state, and — on request — changes it. It appears:
+Three doors to the same setting:
 
 - on the row, as a yellow `⚠ append-only off` part, drawn only when the plugin and the cache
   accounting are on, the live model is cache capable, omp's auto rule does not cover its
@@ -303,7 +308,7 @@ the exact `omp config set …` line, and only `force` re-offers it.
 
 | Knob | Recommended | Why |
 | --- | --- | --- |
-| `provider.appendOnlyContext` | `on`, when the model is cache capable but omp's own auto rule does not cover its provider | a cache read bills a fraction of a miss — on DeepSeek-class routes 2% — and without append-only the system prompt and tool block are re-serialized every request, so the prefix never matches |
+| `provider.appendOnlyContext` | `on`, when the model is cache capable but omp's own auto rule does not cover its provider | a cache read bills a fraction of a miss — on DeepSeek-class routes 2% — and this is the setting that keeps the leading block byte-stable, so a turn where something under it moves does not cost the whole prefix. Insurance, not a doubling: check the hit rate the cache section reports before and after |
 | `display.cacheMissMarker` | `true` on a cache-capable model | a miss is the most expensive event in the session; an invisible one cannot be diagnosed |
 | `tools.artifactSpillThreshold` | sized to the live context window (`contextWindow / 8000`, clamped 8–50 KB) | on a large window a 50 KB inline result is paid for again on every later request |
 | `retry.waitForUsageReset` | `true` | a request that hits a 5-hour or weekly limit sleeps until the reset instead of failing, so a long run finishes without a human restarting it |
