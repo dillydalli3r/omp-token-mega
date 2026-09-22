@@ -406,7 +406,9 @@ export function installBalance(pi, shell) {
 			);
 		} else {
 			lines.push(
-				`- Balance: not polled by this plugin for \`${current.provider}\` — DeepSeek's \`/user/balance\` is the only account endpoint this plugin reads, so ${current.label} contributes no figure here and the table below is this session's own spend.`,
+				windowPolled()
+					? `- Balance: no balance endpoint is read for \`${current.provider}\` — DeepSeek's \`/user/balance\` is the only one this plugin polls. The windows below are the account surface ${current.label} does publish.`
+					: `- Balance: not polled by this plugin for \`${current.provider}\` — DeepSeek's \`/user/balance\` is the only account endpoint this plugin reads, so ${current.label} contributes no figure here and the table below is this session's own spend.`,
 			);
 		}
 
